@@ -1,0 +1,20 @@
+Package: docker-ipv6-firewall
+Version: 1.2.0
+Section: net
+Priority: optional
+Architecture: amd64
+Depends: python3 (>= 3.9), python3-docker, python3-yaml, iptables, systemd
+Maintainer: Sam <sam@example.com>
+Description: Docker IPv6 Firewall Manager
+ Automatically manages IPv6 firewall rules for Docker containers.
+ .
+ This service monitors Docker container events and automatically
+ creates/removes IPv6 firewall rules based on container port
+ exposures and network configurations.
+ .
+ Features:
+  - Automatic Docker container monitoring
+  - Dynamic IPv6 firewall rule management
+  - Macvlan network support
+  - Systemd service integration
+  - Duplicate rule prevention

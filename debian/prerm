@@ -1,0 +1,39 @@
+#!/bin/bash
+set -e
+
+# 停止服务
+if systemctl is-active --quiet docker-ipv6-firewall; then
+    systemctl stop docker-ipv6-firewall.service
+    echo "Docker IPv6 Firewall Manager 已停止"
+fi
+
+# 禁用服务
+systemctl disable docker-ipv6-firewall.service
+
+# 清理防火墙规则
+echo "清理防火墙规则..."
+
+# 使用项目的清理代码
+if [ -f /usr/lib/docker-ipv6-firewall/firewall_manager.py ]; then
+    python3 -c "
+import sys
+sys.path.insert(0, '/usr/lib/docker-ipv6-firewall')
+from config import Config
+from firewall_manager import FirewallManager
+
+config = Config()
+fm = FirewallManager(config)
+
+# 使用项目中的清理方法
+fm._remove_chain_completely()
+fm._cleanup_ipv6_base_rules()
+
+print('防火墙规则清理完成')
+" 2>/dev/null || {
+    echo "项目代码不可用，跳过清理"
+}
+else
+    echo "项目文件不存在，跳过清理"
+fi
+
+exit 0

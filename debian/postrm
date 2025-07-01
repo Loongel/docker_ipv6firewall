@@ -1,0 +1,20 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+    purge)
+        # 完全删除时清理配置和日志
+        rm -rf /etc/docker-ipv6-firewall
+        rm -f /var/log/docker-ipv6-firewall.log
+        echo "配置文件和日志已清理"
+        ;;
+    remove)
+        # 仅删除包时保留配置
+        echo "配置文件已保留在 /etc/docker-ipv6-firewall/"
+        ;;
+esac
+
+# 重新加载systemd
+systemctl daemon-reload
+
+exit 0

@@ -1,0 +1,32 @@
+# Docker IPv6 Firewall Manager 配置文件
+#
+# 此工具专门为 macvlan 网络架构设计，自动管理 Docker 容器的 IPv6 防火墙规则
+#
+# 网络架构：外网 -> parent_interface -> gateway_macvlan -> Docker容器
+#
+# 重要：请确保 parent_interface 和 gateway_macvlan 配置正确，
+#      这两个接口决定了防火墙规则的转发路径
+
+# 网络接口配置（核心配置，必须正确设置）
+parent_interface: ens3                   # 物理网络接口，连接外网
+gateway_macvlan: macvlan_gw             # macvlan网关接口，Docker网络网关
+
+# 防火墙配置
+chain_name: DOCKER_IPV6FW_FORWARD         # 主要FORWARD链名称
+input_chain_name: DOCKER_IPV6FW_INPUT     # IPv6基础协议链名称
+nat_chain_name: DOCKER_IPV6FW_NAT         # NAT规则链名称
+ip6tables_cmd: ip6tables                # ip6tables命令路径
+iptables_cmd: iptables                  # iptables命令路径
+ipv6_link_local: fe80::/10              # IPv6链路本地地址范围
+
+# 监控配置
+monitored_networks:                     # 只监控这些类型的Docker网络
+  - macvlan                            # macvlan网络（主要目标）
+  - bridge                             # bridge网络（如果有IPv6）
+
+# 日志配置
+log_level: DEBUG                        # 日志级别：DEBUG, INFO, WARNING, ERROR
+log_file: /var/log/docker-ipv6-firewall.log
+
+# Docker配置
+docker_socket: unix:///var/run/docker.sock  # Docker socket路径
