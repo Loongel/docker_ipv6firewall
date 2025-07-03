@@ -29,9 +29,16 @@ class Config:
     docker_socket: str = "unix:///var/run/docker.sock"
 
     # 防火墙配置
-    chain_name: str = "DOCKER_IPV6FW_FORWARD"          # 主要FORWARD链名称
+    # IPv6专用链
+    chain_name: str = "DOCKER_IPV6FW_FORWARD"          # IPv6主要FORWARD链名称
     input_chain_name: str = "DOCKER_IPV6FW_INPUT"      # IPv6基础协议链名称
-    nat_chain_name: str = "DOCKER_IPV6FW_NAT"          # NAT规则链名称
+    nat_chain_name: str = "DOCKER_IPV6FW_NAT"          # IPv6 NAT规则链名称
+
+    # IPv4专用链
+    ipv4_chain_name: str = "DOCKER_IPV4FW_FORWARD"     # IPv4主要FORWARD链名称
+    ipv4_nat_chain_name: str = "DOCKER_IPV4FW_NAT"     # IPv4 NAT规则链名称
+
+    # 命令路径
     ip6tables_cmd: str = "ip6tables"                    # ip6tables命令路径
     iptables_cmd: str = "iptables"                      # iptables命令路径
     ipv6_link_local: str = "fe80::/10"                  # IPv6链路本地地址范围
@@ -99,6 +106,10 @@ class Config:
             'gateway_macvlan': self.gateway_macvlan,
             'docker_socket': self.docker_socket,
             'chain_name': self.chain_name,
+            'input_chain_name': self.input_chain_name,
+            'nat_chain_name': self.nat_chain_name,
+            'ipv4_chain_name': self.ipv4_chain_name,
+            'ipv4_nat_chain_name': self.ipv4_nat_chain_name,
             'monitored_networks': self.monitored_networks
         }
         

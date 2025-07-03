@@ -8,11 +8,179 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Planned
-- IPv4 规则支持
 - 更多网络驱动支持
 - 规则模板配置
 - Web 管理界面
 - 性能监控和统计
+
+## [1.3.8] - 2025-07-01
+
+### Added
+- **自定义防火墙端口配置** - 通过Docker Labels配置端口映射，不占用主机端口
+- **灵活的端口映射语法** - 支持简单端口、端口映射、多端口配置
+- **多协议支持** - 支持tcp/udp/all三种协议，all协议自动展开为tcp+udp
+- **完整的使用文档** - 提供详细的配置示例和API文档
+
+### Fixed
+- **重大修复**: 端口分类逻辑错误 - 正确区分Public端口和自定义端口，避免重复规则
+- **重大修复**: Service规则识别错误 - 修复"Service规则不一致"警告，正确识别Service容器IPv6地址
+- **重大修复**: IPv4规则残留问题 - 服务停止时正确清理IPv4防火墙规则
+- **重大安全修复**: 容器隔离漏洞 - 添加INPUT链规则阻止容器访问主机本地服务，保留ICMP/ICMPv6协议
+- **重大修复**: DNAT端口访问问题 - 添加conntrack规则支持NAT映射端口访问
+- **重大修复**: 安全规则优先级 - 容器隔离规则插入到INPUT链第一位，确保最高优先级
+- **性能优化**: 相同端口映射不再创建多余的NAT规则 - 充分利用IPv6直接访问能力
+- **网络模式处理不完整** - 支持Host、Bridge、Overlay等不同网络模式的端口获取
+- **协议硬编码问题** - 修复所有方法中的协议硬编码，正确支持tcp/udp/all协议
+- **Service自定义端口支持** - 支持从Service配置中读取自定义防火墙端口，解决Docker Swarm Labels传递问题
+
+### Removed
+- **废弃EXPOSE端口处理** - 完全移除容器EXPOSE端口的自动处理逻辑
+- **简化端口分类** - 不再区分EXPOSE端口和其他端口类型
+- **移除镜像端口处理** - 不再自动处理Dockerfile中的EXPOSE指令
+
+### Enhanced
+- **简化端口分类系统** - 只处理Service端口、Public端口和自定义端口三种类型
+- **多网络模式支持** - 完整支持Host、Bridge、Overlay网络模式的端口处理
+- **IPv6网络优化** - 相同端口映射直接通过FORWARD规则处理，无需NAT转换
+- **处理流程简化** - 移除复杂的EXPOSE端口处理逻辑，提高性能
+
+### Technical
+- 新增 `_extract_custom_firewall_ports()` 方法解析自定义端口配置
+- 新增 `add_custom_firewall_rules()` 方法处理自定义防火墙规则
+- 重构 `_extract_container_ports()` 方法替代 `_extract_port_mappings()`
+- 新增 `add_container_public_rules()` 方法处理容器Public端口
+- 优化端口处理流程，支持多种网络模式和端口类型
+- 新增 `_ensure_container_isolation_rules()` 方法实现容器安全隔离
+- 新增 `_get_service_custom_ports()` 方法支持Service自定义端口
+
+### Security
+- **容器隔离增强**:
+  - IPv4: `iptables -I INPUT 1 -i macvlan_gw ! -p icmp -m addrtype --dst-type LOCAL -j DROP`
+  - IPv6: `ip6tables -I INPUT 1 -i macvlan_gw ! -p ipv6-icmp -m addrtype --dst-type LOCAL -j DROP`
+- **保留必要协议**: 允许ICMP/ICMPv6用于网络诊断和NDP
+- **精确目标控制**: 使用`--dst-type LOCAL`只保护主机本地地址
+- **最高优先级**: 安全规则插入到第一位，不会被其他规则绕过
+- **DNAT连接跟踪**: 使用conntrack状态跟踪优化NAT后端口访问
+
+### Configuration Syntax
+```yaml
+labels:
+  - "docker-ipv6-firewall.ports=80,443/tcp,53/udp,8080:80/tcp,9000/all"
+```
+
+### Benefits
+- **解决主机端口占用问题** - 不再需要使用ports映射占用主机端口
+- **简化端口管理** - 只处理明确配置的端口，不再自动处理EXPOSE端口
+- **完整的网络支持** - 支持Docker的所有主要网络模式
+- **更好的IPv6支持** - 充分利用IPv6的直接访问能力
+- **提高性能** - 移除EXPOSE端口处理逻辑，减少不必要的规则检查
+
+### Examples
+```yaml
+# 传统方式（占用主机端口）
+ports: ["[::]:809:80"]
+
+# 自定义方式（不占用主机端口）
+labels:
+  - "docker-ipv6-firewall.ports=809:80/tcp"
+```
+
+### Fixed
+- **重大修复**: 端口分类逻辑错误 - 正确区分EXPOSE端口和Public端口，避免重复规则
+- **重大修复**: 网络模式处理不完整 - 支持Host、Bridge、Overlay等不同网络模式的端口获取
+- **重大修复**: Public端口规则创建错误 - Public端口现在正确创建NAT+FORWARD规则，EXPOSE端口只创建FORWARD规则
+- 容器端口处理逻辑重构 - 智能识别端口类型和网络模式
+
+### Added
+- **智能端口分类系统** - 自动区分EXPOSE端口、Public端口和Service端口
+- **多网络模式支持** - 完整支持Host、Bridge、Overlay网络模式的端口处理
+- **端口来源检测** - 支持PortBindings、NetworkSettings.Ports、Service.EndpointSpec.Ports等多种端口来源
+- **Service容器识别** - 通过Labels自动识别Service容器并特殊处理
+
+### Enhanced
+- **端口重叠处理** - Public端口优先级高于EXPOSE端口，避免同一端口创建重复规则
+- **网络模式检测** - 根据NetworkMode自动调整端口处理策略
+- **详细调试日志** - 增加端口提取过程的详细日志，便于故障排除
+- **规则创建优化** - 不同类型端口创建对应类型的防火墙规则
+
+### Technical
+- 新增 `_extract_container_ports()` 方法替代 `_extract_port_mappings()`
+- 新增 `add_container_public_rules()` 方法处理容器Public端口
+- 新增 `_container_public_rules_changed()` 方法检测Public端口变化
+- 重构端口处理流程，支持多种网络模式和端口类型
+- 优化端口信息提取逻辑，提高准确性和可靠性
+
+### Benefits
+- **正确的端口规则** - 解决端口规则混乱和重复的问题
+- **完整的网络支持** - 支持Docker的所有主要网络模式
+- **精确的端口分类** - 每种端口类型都有对应的正确规则
+- **更好的性能** - 避免重复规则，提高防火墙效率
+
+### Root Cause Analysis
+- **问题根因**: 原有代码将所有EXPOSE端口都当作需要FORWARD规则的端口处理，没有区分Public端口和纯EXPOSE端口
+- **修复方案**: 重新设计端口分类逻辑，根据端口来源和网络模式创建对应类型的规则
+- **验证结果**: 容器a10e6a2aa1f8现在正确创建1个EXPOSE规则(443)和3个Public规则(444→443, 80→80, 81→60081)
+
+## [1.3.6] - 2025-07-01
+
+### Fixed
+- **严重修复**: Service端口映射变化时规则不更新的问题 - 修复add_service_rules中的逻辑缺陷
+- **严重修复**: 周期性扫描无法检测Service配置变化的问题 - Service端口从805改为806时规则未更新
+- Service规则变化检测逻辑错误 - 现在会正确比较端口、协议、容器IPv6地址等变化
+
+### Added
+- **Service规则变化检测机制** - 实现详细的规则比较逻辑，检测端口、协议、容器等变化
+- **智能Service规则更新** - 检测到变化时先移除旧规则，再添加新规则
+- **增强的调试日志** - 详细记录Service规则变化检测过程和端口映射信息
+
+### Enhanced
+- **周期性扫描改进** - 现在能够正确检测和处理Service配置变化
+- **Service更新日志** - 增加详细的Service检查和规则更新日志
+- **规则一致性保障** - 确保防火墙规则与实际Service配置始终保持一致
+
+### Technical
+- 修复 `add_service_rules()` 方法中的早期返回逻辑缺陷
+- 新增 `_service_rules_changed()` 方法实现规则变化检测
+- 改进周期性扫描的日志级别和详细程度
+- 增强Service规则的调试信息输出
+
+### Benefits
+- **Service端口变化正确处理** - 解决Service端口映射变化时访问失败的问题
+- **实时配置同步** - 周期性扫描能够检测并修复配置不一致
+- **更好的故障排除** - 详细的日志便于诊断Service规则问题
+- **系统稳定性提升** - 防止Service配置变化导致的网络访问异常
+
+## [1.3.5] - 2025-07-01
+
+### Added
+- **完整的IPv4防火墙支持** - 为IPv4创建专用链架构，确保规则组织性和安全清理
+- **IPv4专用链设计** - `DOCKER_IPV4FW_FORWARD`（FORWARD规则）和`DOCKER_IPV4FW_NAT`（NAT规则）
+- **IPv4容器上网完整规则** - 添加容器到外网的FORWARD规则和NAT MASQUERADE规则
+- **IPv4规则安全管理** - 所有IPv4规则现在都在专用链中，避免与系统规则混合
+
+### Fixed
+- **重要修复**: IPv4容器无法上网的问题 - 添加缺失的FORWARD和NAT规则
+- **重要修复**: IPv4规则重复添加和误删系统规则的问题 - 使用专用链管理
+- IPv4 ICMP转发规则现在使用专用链而非直接添加到系统FORWARD链
+
+### Enhanced
+- **统一的链管理架构** - IPv4和IPv6都使用相同的专用链管理模式
+- **完整的IPv4网络支持** - 支持容器访问外网的所有必要规则
+- **规则清理安全性** - IPv4规则清理不会影响系统原有规则
+
+### Technical
+- 新增 `ipv4_chain_name` 和 `ipv4_nat_chain_name` 配置项
+- 新增 `_ensure_ipv4_nat_chain_exists()` 方法管理IPv4 NAT链
+- 新增 `_setup_ipv4_container_internet_rules()` 方法设置IPv4上网规则
+- 扩展 `_ensure_all_chains_exist()` 和 `_flush_all_chains()` 支持IPv4
+- IPv4 ICMP规则迁移到专用链：`DOCKER_IPV4FW_FORWARD`
+- IPv4 NAT规则使用专用链：`DOCKER_IPV4FW_NAT`
+
+### Benefits
+- **IPv4容器正常上网** - 解决容器无法访问外网的问题
+- **规则管理一致性** - IPv4和IPv6使用相同的管理模式
+- **安全的规则清理** - 不会误删系统原有的iptables规则
+- **易于故障排除** - 所有规则都有明确的链标识
 
 ## [1.3.4] - 2025-07-01
 

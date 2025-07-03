@@ -5,6 +5,7 @@ Docker容器监控模块
 
 import docker
 import logging
+import subprocess
 import threading
 import time
 from typing import Dict, List, Any
@@ -128,7 +129,7 @@ class DockerMonitor:
                 if not self.running:
                     break
 
-                self.logger.debug("执行周期性扫描（兜底机制）")
+                self.logger.info("执行周期性扫描（兜底机制）- 检查容器和Service状态一致性")
 
                 # 清理不存在的容器和Service规则
                 self._cleanup_stale_rules()
@@ -150,18 +151,44 @@ class DockerMonitor:
             if container_info:
                 self.logger.info(f"处理容器启动: {container_info['name']}")
                 
-                port_mappings = self._extract_port_mappings(container_info)
+                port_info = self._extract_container_ports(container_info)
                 networks = container_info.get('networks', {})
-                
-                if port_mappings and networks:
-                    self.firewall_manager.add_container_rules(
-                        container_id, 
-                        container_info['name'],
-                        port_mappings,
-                        networks
-                    )
+
+                # 检查是否为Service容器
+                labels = container_info.get('config', {}).get('Labels', {})
+                service_name = labels.get('com.docker.swarm.service.name')
+
+                # 如果是Service容器，尝试从Service配置中获取自定义防火墙端口
+                if service_name and not port_info['custom_ports']:
+                    service_custom_ports = self._get_service_custom_ports(service_name)
+                    if service_custom_ports:
+                        port_info['custom_ports'] = service_custom_ports
+                        self.logger.debug(f"从Service {service_name} 获取自定义端口: {service_custom_ports}")
+
+                if networks:
+                    # 处理Public端口（容器级别的端口映射）
+                    if port_info['public_ports']:
+                        self.firewall_manager.add_container_public_rules(
+                            container_id,
+                            container_info['name'],
+                            port_info['public_ports'],
+                            networks
+                        )
+
+                    # 处理自定义防火墙端口
+                    if port_info['custom_ports']:
+                        self.firewall_manager.add_custom_firewall_rules(
+                            container_id,
+                            container_info['name'],
+                            port_info['custom_ports'],
+                            networks
+                        )
+                        self.logger.info(f"为容器 {container_info['name']} 处理自定义防火墙端口")
+
+                    if not any([port_info['public_ports'], port_info['custom_ports']]):
+                        self.logger.debug(f"容器 {container_info['name']} 无需要处理的端口")
                 else:
-                    self.logger.debug(f"容器 {container_info['name']} 无需要处理的端口或网络")
+                    self.logger.debug(f"容器 {container_info['name']} 无监控网络")
 
                 # 检查是否是Service容器，如果是则触发Service处理
                 self._check_and_handle_service_container(container_info)
@@ -265,55 +292,188 @@ class DockerMonitor:
             self.logger.error(f"获取容器信息失败 {container.id}: {e}")
             return None
             
-    def _extract_port_mappings(self, container_info: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """提取端口映射信息"""
-        port_mappings = []
-        
+    def _extract_container_ports(self, container_info: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+        """提取容器端口信息，智能分类处理不同网络模式"""
+        result = {
+            'public_ports': []   # Public端口映射
+        }
+
         try:
-            # 从Config.ExposedPorts获取暴露的端口
-            exposed_ports = container_info.get('config', {}).get('ExposedPorts', {})
-            
-            for port_spec in exposed_ports.keys():
-                # 解析端口格式，如 "80/tcp"
-                if '/' in port_spec:
-                    port_str, protocol = port_spec.split('/', 1)
-                    try:
-                        port = int(port_str)
-                        port_mappings.append({
-                            'port': port,
-                            'protocol': protocol
-                        })
-                    except ValueError:
-                        self.logger.warning(f"无法解析端口: {port_spec}")
-                        
-            # 也检查HostConfig.PortBindings（如果有端口绑定）
+            # 1. 检测网络模式
+            network_mode = container_info.get('host_config', {}).get('NetworkMode', 'bridge')
+
+            # 2. 获取基础端口信息
             port_bindings = container_info.get('host_config', {}).get('PortBindings', {})
-            for port_spec, bindings in port_bindings.items():
-                if '/' in port_spec and bindings:
-                    port_str, protocol = port_spec.split('/', 1)
-                    try:
-                        port = int(port_str)
-                        # 检查是否已经在列表中
-                        if not any(pm['port'] == port and pm['protocol'] == protocol 
-                                 for pm in port_mappings):
-                            port_mappings.append({
-                                'port': port,
-                                'protocol': protocol
-                            })
-                    except ValueError:
-                        self.logger.warning(f"无法解析绑定端口: {port_spec}")
-                        
+            network_ports = container_info.get('network_settings', {}).get('Ports', {})
+
+            # 3. 检查是否为Service容器和自定义防火墙配置
+            labels = container_info.get('config', {}).get('Labels', {})
+            is_service_container = 'com.docker.swarm.service.name' in labels
+
+            # 检查自定义防火墙Labels
+            custom_firewall_ports = self._extract_custom_firewall_ports(labels)
+
+            self.logger.debug(f"端口提取 - 网络模式: {network_mode}, Service容器: {is_service_container}")
+            self.logger.debug(f"端口绑定: {list(port_bindings.keys())}")
+
+            # 4. 处理Public端口映射（优先级最高）
+            public_port_set = set()
+
+            # 优先使用PortBindings（配置时定义）
+            if port_bindings:
+                for port_spec, bindings in port_bindings.items():
+                    if '/' in port_spec and bindings:
+                        port_str, protocol = port_spec.split('/', 1)
+                        try:
+                            container_port = int(port_str)
+                            host_port = int(bindings[0].get('HostPort', 0))
+                            host_ip = bindings[0].get('HostIp', '')
+
+                            if host_port > 0:
+                                result['public_ports'].append({
+                                    'container_port': container_port,
+                                    'host_port': host_port,
+                                    'host_ip': host_ip,
+                                    'protocol': protocol,
+                                    'type': 'public',
+                                    'source': 'PortBindings'
+                                })
+                                public_port_set.add(f"{container_port}/{protocol}")
+
+                        except (ValueError, IndexError, TypeError) as e:
+                            self.logger.warning(f"无法解析端口绑定 {port_spec}: {e}")
+
+            # 补充使用NetworkSettings.Ports（运行时状态）
+            elif network_ports and network_mode == 'bridge':
+                for port_spec, bindings in network_ports.items():
+                    if '/' in port_spec and bindings:
+                        port_str, protocol = port_spec.split('/', 1)
+                        try:
+                            container_port = int(port_str)
+                            # 选择第一个有效绑定
+                            for binding in bindings:
+                                host_port = int(binding.get('HostPort', 0))
+                                host_ip = binding.get('HostIp', '')
+
+                                if host_port > 0:
+                                    port_key = f"{container_port}/{protocol}"
+                                    if port_key not in public_port_set:
+                                        result['public_ports'].append({
+                                            'container_port': container_port,
+                                            'host_port': host_port,
+                                            'host_ip': host_ip,
+                                            'protocol': protocol,
+                                            'type': 'public',
+                                            'source': 'NetworkSettings'
+                                        })
+                                        public_port_set.add(port_key)
+                                    break
+
+                        except (ValueError, TypeError) as e:
+                            self.logger.warning(f"无法解析网络端口 {port_spec}: {e}")
+
+            # 5. Host网络模式特殊处理
+            if network_mode == 'host':
+                # Host模式下没有端口映射
+                result['public_ports'] = []
+                self.logger.debug("Host网络模式：清空Public端口")
+
         except Exception as e:
-            self.logger.error(f"提取端口映射失败: {e}")
-            
-        return port_mappings
+            self.logger.error(f"提取容器端口信息失败: {e}")
+
+        # 6. 处理自定义防火墙端口配置
+        if custom_firewall_ports:
+            self.logger.debug(f"检测到自定义防火墙端口配置: {custom_firewall_ports}")
+            result['custom_ports'] = custom_firewall_ports
+        else:
+            result['custom_ports'] = []
+
+        self.logger.debug(f"端口提取结果 - Public: {len(result['public_ports'])}, Custom: {len(result['custom_ports'])}")
+        return result
+
+    def _extract_custom_firewall_ports(self, labels: Dict[str, str]) -> List[Dict[str, Any]]:
+        """提取自定义防火墙端口配置"""
+        custom_ports = []
+
+        try:
+            # 提取端口配置（不需要enable标志）
+            ports_config = labels.get('docker-ipv6-firewall.ports', '')
+            if not ports_config:
+                return custom_ports
+
+            # 解析端口配置，支持多种格式：
+            # "809/tcp" - 简单端口
+            # "809:80/tcp" - 端口映射
+            # "809/tcp,443:444/tcp" - 多个端口
+            for port_spec in ports_config.split(','):
+                port_spec = port_spec.strip()
+                if not port_spec:
+                    continue
+
+                try:
+                    # 解析协议
+                    if '/' in port_spec:
+                        port_part, protocol = port_spec.rsplit('/', 1)
+                    else:
+                        port_part, protocol = port_spec, 'tcp'
+
+                    # 解析端口映射
+                    if ':' in port_part:
+                        # 格式: "809:80" (外部端口:内部端口)
+                        external_port_str, internal_port_str = port_part.split(':', 1)
+                        external_port = int(external_port_str)
+                        internal_port = int(internal_port_str)
+                    else:
+                        # 格式: "809" (端口相同)
+                        external_port = internal_port = int(port_part)
+
+                    custom_ports.append({
+                        'external_port': external_port,
+                        'internal_port': internal_port,
+                        'protocol': protocol,
+                        'type': 'custom_firewall'
+                    })
+
+                    self.logger.debug(f"解析自定义端口: {external_port}:{internal_port}/{protocol}")
+
+                except (ValueError, IndexError) as e:
+                    self.logger.warning(f"无法解析自定义防火墙端口配置 '{port_spec}': {e}")
+
+        except Exception as e:
+            self.logger.error(f"提取自定义防火墙端口配置失败: {e}")
+
+        return custom_ports
+
+    def _get_service_custom_ports(self, service_name: str) -> List[Dict[str, Any]]:
+        """从Service配置中获取自定义防火墙端口"""
+        try:
+            # 获取Service配置
+            result = subprocess.run(
+                ['docker', 'service', 'inspect', service_name, '--format', '{{ json .Spec.TaskTemplate.ContainerSpec.Labels }}'],
+                capture_output=True, text=True, timeout=10
+            )
+
+            if result.returncode != 0:
+                self.logger.warning(f"无法获取Service {service_name} 配置: {result.stderr}")
+                return []
+
+            # 解析Service Labels
+            import json
+            service_labels = json.loads(result.stdout.strip())
+
+            # 提取自定义防火墙端口配置
+            return self._extract_custom_firewall_ports(service_labels)
+
+        except Exception as e:
+            self.logger.error(f"获取Service {service_name} 自定义端口失败: {e}")
+            return []
 
     def _process_existing_services(self):
         """处理现有的Services"""
         try:
             # 获取本节点的Services
             local_services = self._get_local_services()
-            self.logger.info(f"发现 {len(local_services)} 个本节点的Services")
+            self.logger.info(f"周期性扫描: 发现 {len(local_services)} 个本节点的Services，检查配置变化")
 
             for service_name in local_services:
                 self._handle_service_update(service_name)
@@ -370,7 +530,13 @@ class DockerMonitor:
                 self.logger.debug(f"Service {service_name} 在本节点没有容器")
                 return
 
-            self.logger.info(f"处理Service: {service_name}, 端口: {len(service_ports)}, 容器: {len(service_containers)}")
+            self.logger.info(f"检查Service: {service_name}, 端口: {len(service_ports)}, 容器: {len(service_containers)}")
+
+            # 记录端口详情便于调试
+            port_details = []
+            for port in service_ports:
+                port_details.append(f"{port.get('protocol', 'tcp')}:{port.get('published_port')}->{port.get('target_port')}")
+            self.logger.debug(f"Service {service_name} 端口映射: {', '.join(port_details)}")
 
             # 添加Service规则
             self.firewall_manager.add_service_rules(

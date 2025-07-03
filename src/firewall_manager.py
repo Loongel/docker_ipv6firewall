@@ -64,7 +64,8 @@ class FirewallManager:
         self._flush_all_chains()
 
         # 设置基础规则
-        self._setup_base_rules()
+        self._ensure_base_rules()  # FORWARD链的DNAT conntrack规则
+        self._setup_base_rules()   # INPUT链的IPv6基础协议和容器隔离规则
 
         # 清空内存中的规则记录
         self.active_rules.clear()
@@ -102,6 +103,7 @@ class FirewallManager:
 
     def _ensure_all_chains_exist(self):
         """确保所有专用链存在并被正确引用"""
+        # IPv6专用链
         # 1. FORWARD链 -> DOCKER_IPV6_FORWARD (容器和Service规则)
         self._ensure_chain_exists(self.config.ip6tables_cmd, self.config.chain_name)
 
@@ -110,6 +112,13 @@ class FirewallManager:
 
         # 3. PREROUTING链 -> DOCKER_IPV6_NAT (NAT规则)
         self._ensure_nat_chain_exists()
+
+        # IPv4专用链
+        # 4. FORWARD链 -> DOCKER_IPV4_FORWARD (IPv4容器规则)
+        self._ensure_chain_exists(self.config.iptables_cmd, self.config.ipv4_chain_name)
+
+        # 5. POSTROUTING链 -> DOCKER_IPV4_NAT (IPv4 NAT规则)
+        self._ensure_ipv4_nat_chain_exists()
 
     def _ensure_input_chain_exists(self):
         """确保INPUT专用链存在并被正确引用"""
@@ -161,6 +170,135 @@ class FirewallManager:
             self.logger.error(f"确保NAT专用链存在失败: {e}")
             raise
 
+    def _ensure_ipv4_nat_chain_exists(self):
+        """确保IPv4 NAT专用链存在并被正确引用"""
+        try:
+            # 检查链是否存在
+            result = subprocess.run([self.config.iptables_cmd, "-t", "nat", "-L", self.config.ipv4_nat_chain_name],
+                                  capture_output=True, text=True)
+            if result.returncode != 0:
+                # 创建链
+                subprocess.run([self.config.iptables_cmd, "-t", "nat", "-N", self.config.ipv4_nat_chain_name], check=True)
+                self.logger.info(f"创建IPv4 NAT专用链: {self.config.ipv4_nat_chain_name}")
+
+            # 检查POSTROUTING链中是否有对此链的引用
+            postrouting_check = subprocess.run([self.config.iptables_cmd, "-t", "nat", "-C", "POSTROUTING", "-j", self.config.ipv4_nat_chain_name],
+                                            capture_output=True, text=True)
+
+            if postrouting_check.returncode != 0:
+                # POSTROUTING链中没有引用，添加引用
+                subprocess.run([self.config.iptables_cmd, "-t", "nat", "-I", "POSTROUTING", "1",
+                              "-j", self.config.ipv4_nat_chain_name], check=True)
+                self.logger.info(f"将链 {self.config.ipv4_nat_chain_name} 插入到POSTROUTING链")
+
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"确保IPv4 NAT专用链存在失败: {e}")
+            raise
+
+    def _ensure_base_rules(self):
+        """确保基础规则存在"""
+        try:
+            # IPv6 DNAT conntrack规则 - 允许所有经过NAT转换的连接
+            dnat_rule_check = subprocess.run([
+                self.config.ip6tables_cmd, "-C", self.config.chain_name,
+                "-i", self.config.parent_interface,
+                "-o", self.config.gateway_macvlan,
+                "-m", "conntrack", "--ctstate", "DNAT",
+                "-j", "ACCEPT"
+            ], capture_output=True, text=True)
+
+            if dnat_rule_check.returncode != 0:
+                # 添加DNAT conntrack规则
+                subprocess.run([
+                    self.config.ip6tables_cmd, "-I", self.config.chain_name, "1",
+                    "-i", self.config.parent_interface,
+                    "-o", self.config.gateway_macvlan,
+                    "-m", "conntrack", "--ctstate", "DNAT",
+                    "-j", "ACCEPT"
+                ], check=True)
+                self.logger.info("添加IPv6 DNAT conntrack基础规则")
+            else:
+                self.logger.debug("IPv6 DNAT conntrack基础规则已存在")
+
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"确保基础规则失败: {e}")
+            raise
+
+    def _ensure_container_isolation_rules(self):
+        """确保容器隔离规则存在 - 阻止容器访问主机本地服务"""
+        try:
+            # IPv4容器隔离规则 - 使用正确的协议否定语法
+            ipv4_isolation_check = subprocess.run([
+                self.config.iptables_cmd, "-C", "INPUT",
+                "-i", self.config.gateway_macvlan,
+                "!", "-p", "icmp",
+                "-m", "addrtype", "--dst-type", "LOCAL",
+                "-j", "DROP"
+            ], capture_output=True, text=True)
+
+            if ipv4_isolation_check.returncode != 0:
+                subprocess.run([
+                    self.config.iptables_cmd, "-I", "INPUT", "1",
+                    "-i", self.config.gateway_macvlan,
+                    "!", "-p", "icmp",
+                    "-m", "addrtype", "--dst-type", "LOCAL",
+                    "-j", "DROP"
+                ], check=True)
+                self.logger.info("添加IPv4容器隔离规则 - 阻止容器访问主机本地服务（插入到第1位）")
+            else:
+                self.logger.debug("IPv4容器隔离规则已存在")
+
+            # IPv6容器隔离规则 - 使用正确的协议否定语法
+            ipv6_isolation_check = subprocess.run([
+                self.config.ip6tables_cmd, "-C", "INPUT",
+                "-i", self.config.gateway_macvlan,
+                "!", "-p", "ipv6-icmp",
+                "-m", "addrtype", "--dst-type", "LOCAL",
+                "-j", "DROP"
+            ], capture_output=True, text=True)
+
+            if ipv6_isolation_check.returncode != 0:
+                subprocess.run([
+                    self.config.ip6tables_cmd, "-I", "INPUT", "1",
+                    "-i", self.config.gateway_macvlan,
+                    "!", "-p", "ipv6-icmp",
+                    "-m", "addrtype", "--dst-type", "LOCAL",
+                    "-j", "DROP"
+                ], check=True)
+                self.logger.info("添加IPv6容器隔离规则 - 阻止容器访问主机本地服务（插入到第1位）")
+            else:
+                self.logger.debug("IPv6容器隔离规则已存在")
+
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"确保容器隔离规则失败: {e}")
+            raise
+
+    def _cleanup_container_isolation_rules(self):
+        """清理容器隔离规则"""
+        try:
+            # 清理IPv4容器隔离规则
+            subprocess.run([
+                self.config.iptables_cmd, "-D", "INPUT",
+                "-i", self.config.gateway_macvlan,
+                "!", "-p", "icmp",
+                "-m", "addrtype", "--dst-type", "LOCAL",
+                "-j", "DROP"
+            ], check=False, capture_output=True)
+            self.logger.debug("清理IPv4容器隔离规则")
+
+            # 清理IPv6容器隔离规则
+            subprocess.run([
+                self.config.ip6tables_cmd, "-D", "INPUT",
+                "-i", self.config.gateway_macvlan,
+                "!", "-p", "ipv6-icmp",
+                "-m", "addrtype", "--dst-type", "LOCAL",
+                "-j", "DROP"
+            ], check=False, capture_output=True)
+            self.logger.debug("清理IPv6容器隔离规则")
+
+        except Exception as e:
+            self.logger.warning(f"清理容器隔离规则时出错: {e}")
+
     def _flush_chain(self):
         """清空主FORWARD链中的所有规则"""
         try:
@@ -176,10 +314,10 @@ class FirewallManager:
 
     def _flush_all_chains(self):
         """清空所有专用链中的规则"""
-        # 清空FORWARD专用链
+        # 清空IPv6 FORWARD专用链
         self._flush_chain()
 
-        # 清空INPUT专用链
+        # 清空IPv6 INPUT专用链
         try:
             result = subprocess.run([self.config.ip6tables_cmd, "-F", self.config.input_chain_name],
                                   capture_output=True, text=True)
@@ -188,14 +326,35 @@ class FirewallManager:
         except subprocess.CalledProcessError as e:
             self.logger.warning(f"清空IPv6基础协议链失败: {e}")
 
-        # 清空NAT专用链
+        # 清空IPv6 NAT专用链
         try:
             result = subprocess.run([self.config.ip6tables_cmd, "-t", "nat", "-F", self.config.nat_chain_name],
                                   capture_output=True, text=True)
             if result.returncode == 0:
-                self.logger.info(f"已清空NAT专用链 {self.config.nat_chain_name}")
+                self.logger.info(f"已清空IPv6 NAT专用链 {self.config.nat_chain_name}")
         except subprocess.CalledProcessError as e:
-            self.logger.warning(f"清空NAT专用链失败: {e}")
+            self.logger.warning(f"清空IPv6 NAT专用链失败: {e}")
+
+        # 清空IPv4 FORWARD专用链
+        try:
+            result = subprocess.run([self.config.iptables_cmd, "-F", self.config.ipv4_chain_name],
+                                  capture_output=True, text=True)
+            if result.returncode == 0:
+                self.logger.info(f"已清空IPv4 FORWARD专用链 {self.config.ipv4_chain_name}")
+        except subprocess.CalledProcessError as e:
+            self.logger.warning(f"清空IPv4 FORWARD专用链失败: {e}")
+
+        # 清空IPv4 NAT专用链
+        try:
+            result = subprocess.run([self.config.iptables_cmd, "-t", "nat", "-F", self.config.ipv4_nat_chain_name],
+                                  capture_output=True, text=True)
+            if result.returncode == 0:
+                self.logger.info(f"已清空IPv4 NAT专用链 {self.config.ipv4_nat_chain_name}")
+        except subprocess.CalledProcessError as e:
+            self.logger.warning(f"清空IPv4 NAT专用链失败: {e}")
+
+        # 清理容器隔离规则
+        self._cleanup_container_isolation_rules()
 
     def _remove_chain_completely(self):
         """完全删除防火墙链（用于彻底清理）"""
@@ -317,6 +476,9 @@ class FirewallManager:
 
         self.logger.info("IPv6基础协议支持规则设置完成")
 
+        # 添加容器隔离规则（必须在最后，确保优先级最高）
+        self._ensure_container_isolation_rules()
+
         # 添加ICMPv6/NDP协议的FORWARD规则（接口间转发）
         self._setup_icmpv6_forward_rules()
 
@@ -334,13 +496,13 @@ class FirewallManager:
              "-o", self.config.parent_interface, "-p", "icmpv6", "-j", "ACCEPT"]
         ]
 
-        # ICMPv4协议双向转发规则（直接添加到FORWARD链，因为我们主要管理IPv6）
+        # ICMPv4协议双向转发规则（使用IPv4专用链）
         icmpv4_forward_rules = [
             # 主接口到macvlan网关的ICMPv4转发
-            ["-A", "FORWARD", "-i", self.config.parent_interface,
+            ["-A", self.config.ipv4_chain_name, "-i", self.config.parent_interface,
              "-o", self.config.gateway_macvlan, "-p", "icmp", "-j", "ACCEPT"],
             # macvlan网关到主接口的ICMPv4转发
-            ["-A", "FORWARD", "-i", self.config.gateway_macvlan,
+            ["-A", self.config.ipv4_chain_name, "-i", self.config.gateway_macvlan,
              "-o", self.config.parent_interface, "-p", "icmp", "-j", "ACCEPT"]
         ]
 
@@ -367,6 +529,51 @@ class FirewallManager:
                 self.logger.error(f"添加ICMPv4 FORWARD规则失败: {e}")
 
         self.logger.info("ICMP/ICMPv6协议FORWARD规则设置完成")
+
+        # 设置IPv4容器上网的完整规则
+        self._setup_ipv4_container_internet_rules()
+
+    def _setup_ipv4_container_internet_rules(self):
+        """设置IPv4容器上网的完整规则 - 确保IPv4容器能正常访问外网"""
+        self.logger.info("设置IPv4容器上网规则")
+
+        # IPv4容器上网的FORWARD规则
+        ipv4_forward_rules = [
+            # 1. 容器到外网的FORWARD规则（gateway_macvlan -> parent_interface）
+            ["-A", self.config.ipv4_chain_name, "-i", self.config.gateway_macvlan,
+             "-o", self.config.parent_interface, "-j", "ACCEPT"]
+        ]
+
+        # IPv4 NAT MASQUERADE规则（POSTROUTING链）
+        ipv4_nat_rules = [
+            # 4. NAT MASQUERADE规则 - 容器访问外网时进行地址伪装
+            ["-t", "nat", "-A", self.config.ipv4_nat_chain_name,
+             "-o", self.config.parent_interface, "-j", "MASQUERADE"]
+        ]
+
+        # 添加IPv4 FORWARD规则
+        for rule in ipv4_forward_rules:
+            try:
+                if not self._rule_exists(self.config.iptables_cmd, rule):
+                    subprocess.run([self.config.iptables_cmd] + rule, check=True)
+                    self.logger.info(f"添加IPv4 FORWARD规则: {rule[2]} -> {rule[4]}")
+                else:
+                    self.logger.debug(f"IPv4 FORWARD规则已存在: {rule[2]} -> {rule[4]}")
+            except subprocess.CalledProcessError as e:
+                self.logger.error(f"添加IPv4 FORWARD规则失败: {e}")
+
+        # 添加IPv4 NAT规则
+        for rule in ipv4_nat_rules:
+            try:
+                if not self._rule_exists(self.config.iptables_cmd, rule):
+                    subprocess.run([self.config.iptables_cmd] + rule, check=True)
+                    self.logger.info(f"添加IPv4 NAT MASQUERADE规则: {rule[4]} -> {rule[6]}")
+                else:
+                    self.logger.debug(f"IPv4 NAT MASQUERADE规则已存在: {rule[4]} -> {rule[6]}")
+            except subprocess.CalledProcessError as e:
+                self.logger.error(f"添加IPv4 NAT MASQUERADE规则失败: {e}")
+
+        self.logger.info("IPv4容器上网规则设置完成")
 
     def _rule_exists(self, iptables_cmd: str, rule: List[str]) -> bool:
         """检查规则是否存在"""
@@ -397,24 +604,28 @@ class FirewallManager:
             if not ipv6_address:
                 continue
                 
-            # 处理暴露的端口
+            # 处理端口映射
             for port_info in port_mappings:
                 protocol = port_info.get('protocol', 'tcp')
                 port = port_info.get('port')
-                
+
                 if port:
-                    rule = FirewallRule(
-                        container_id=container_id,
-                        container_name=container_name,
-                        protocol=protocol,
-                        port=port,
-                        ipv6_address=ipv6_address,
-                        interface_in=self.config.parent_interface,
-                        interface_out=self.config.gateway_macvlan
-                    )
-                    
-                    if self._add_firewall_rule(rule):
-                        rules.append(rule)
+                    # 处理all协议（创建tcp和udp两条规则）
+                    protocols_to_process = ['tcp', 'udp'] if protocol == 'all' else [protocol]
+
+                    for actual_protocol in protocols_to_process:
+                        rule = FirewallRule(
+                            container_id=container_id,
+                            container_name=container_name,
+                            protocol=actual_protocol,
+                            port=port,
+                            ipv6_address=ipv6_address,
+                            interface_in=self.config.parent_interface,
+                            interface_out=self.config.gateway_macvlan
+                        )
+
+                        if self._add_firewall_rule(rule):
+                            rules.append(rule)
                         
         if rules:
             self.active_rules[container_id] = rules
@@ -469,7 +680,298 @@ class FirewallManager:
                 
         del self.active_rules[container_id]
         self.logger.info(f"移除容器 {rules[0].container_name} 的 {removed_count} 条规则")
-        
+
+    def add_container_public_rules(self, container_id: str, container_name: str,
+                                  public_ports: List[Dict], networks: Dict):
+        """为容器的Public端口添加NAT和防火墙规则"""
+        # 使用特殊的ID来区分Public端口规则
+        public_rule_id = f"{container_id}_public"
+
+        # 检查是否需要更新规则
+        if public_rule_id in self.active_service_rules:
+            # 比较现有规则与新配置，如果有变化则先移除旧规则
+            if self._container_public_rules_changed(public_rule_id, public_ports, networks):
+                self.logger.info(f"检测到容器 {container_name} Public端口配置变化，更新规则")
+                self.remove_service_rules(public_rule_id)
+            else:
+                self.logger.debug(f"容器 {container_name} Public端口规则无变化，跳过")
+                return
+
+        rules = []
+
+        # 处理每个网络接口
+        for network_name, network_info in networks.items():
+            if not self._should_monitor_network(network_name):
+                continue
+
+            ipv6_address = network_info.get('GlobalIPv6Address')
+            if not ipv6_address:
+                continue
+
+            # 处理Public端口映射
+            for port_info in public_ports:
+                protocol = port_info.get('protocol', 'tcp')
+                container_port = port_info.get('container_port')
+                host_port = port_info.get('host_port')
+                host_ip = port_info.get('host_ip', '')
+
+                if container_port and host_port:
+                    # 处理all协议（创建tcp和udp两条规则）
+                    protocols_to_process = ['tcp', 'udp'] if protocol == 'all' else [protocol]
+
+                    for actual_protocol in protocols_to_process:
+                        # 只为端口不同的映射创建NAT规则
+                        if host_port != container_port:
+                            # 创建NAT + FORWARD规则（类似Service规则）
+                            rule = ServiceRule(
+                                service_id=public_rule_id,
+                                service_name=f"{container_name}_public",
+                                container_id=container_id,
+                                container_name=container_name,
+                                protocol=actual_protocol,
+                                published_port=host_port,
+                                target_port=container_port,
+                                container_ipv6=ipv6_address,
+                                interface_in=self.config.parent_interface,
+                                interface_out=self.config.gateway_macvlan
+                            )
+
+                            if self._add_service_rule(rule):
+                                rules.append(rule)
+                                self.logger.debug(f"  创建NAT规则: {host_port}->{container_port}/{actual_protocol} (端口不同)")
+                        else:
+                            # 端口相同，只需要FORWARD规则，无需NAT转换
+                            self.logger.debug(f"  跳过NAT规则: {host_port}->{container_port}/{actual_protocol} (端口相同，IPv6可直接访问)")
+
+                            # 创建FORWARD规则
+                            forward_rule = FirewallRule(
+                                container_id=container_id,
+                                container_name=container_name,
+                                protocol=actual_protocol,
+                                port=container_port,
+                                ipv6_address=ipv6_address,
+                                interface_in=self.config.parent_interface,
+                                interface_out=self.config.gateway_macvlan
+                            )
+
+                            # 检查是否已经有相同的FORWARD规则
+                            if container_id in self.active_rules:
+                                existing_rules = self.active_rules[container_id]
+                                rule_exists = any(
+                                    r.protocol == actual_protocol and r.port == container_port and r.ipv6_address == ipv6_address
+                                    for r in existing_rules
+                                )
+                                if not rule_exists and self._add_firewall_rule(forward_rule):
+                                    existing_rules.append(forward_rule)
+                                    self.logger.debug(f"  添加FORWARD规则: {container_port}/{actual_protocol} (端口相同)")
+                            else:
+                                if self._add_firewall_rule(forward_rule):
+                                    self.active_rules[container_id] = [forward_rule]
+                                    self.logger.debug(f"  添加FORWARD规则: {container_port}/{actual_protocol} (端口相同)")
+
+        if rules:
+            self.active_service_rules[public_rule_id] = rules
+            self.logger.info(f"为容器 {container_name} 添加了 {len(rules)} 条Public端口规则")
+
+            # 记录详细的规则信息便于调试
+            for rule in rules:
+                self.logger.debug(f"  容器Public规则: {rule.protocol}:{rule.published_port}->{rule.target_port} -> {rule.container_ipv6}")
+        else:
+            self.logger.debug(f"容器 {container_name} 没有生成有效Public端口规则")
+
+    def _container_public_rules_changed(self, public_rule_id: str, new_public_ports: List[Dict],
+                                       new_networks: Dict) -> bool:
+        """检测容器Public端口规则是否发生变化"""
+        if public_rule_id not in self.active_service_rules:
+            return True  # 没有现有规则，需要添加
+
+        existing_rules = self.active_service_rules[public_rule_id]
+
+        # 构建新规则的特征集合用于比较
+        new_rule_signatures = set()
+        for network_name, network_info in new_networks.items():
+            if not self._should_monitor_network(network_name):
+                continue
+
+            ipv6_address = network_info.get('GlobalIPv6Address')
+            if not ipv6_address:
+                continue
+
+            for port_info in new_public_ports:
+                protocol = port_info.get('protocol', 'tcp')
+                container_port = port_info.get('container_port')
+                host_port = port_info.get('host_port')
+
+                if container_port and host_port:
+                    # 处理all协议（创建tcp和udp两个特征）
+                    protocols_to_check = ['tcp', 'udp'] if protocol == 'all' else [protocol]
+
+                    for actual_protocol in protocols_to_check:
+                        # 只为端口不同的映射创建NAT规则特征
+                        if host_port != container_port:
+                            # 创建规则特征：协议_宿主机端口_容器端口_IPv6地址
+                            signature = f"{actual_protocol}_{host_port}_{container_port}_{ipv6_address}"
+                            new_rule_signatures.add(signature)
+
+        # 构建现有规则的特征集合
+        existing_rule_signatures = set()
+        for rule in existing_rules:
+            signature = f"{rule.protocol}_{rule.published_port}_{rule.target_port}_{rule.container_ipv6}"
+            existing_rule_signatures.add(signature)
+
+        # 比较两个集合是否相同
+        rules_changed = new_rule_signatures != existing_rule_signatures
+
+        if rules_changed:
+            self.logger.info(f"容器Public端口 {public_rule_id} 规则变化检测:")
+            self.logger.info(f"  现有规则: {existing_rule_signatures}")
+            self.logger.info(f"  新规则: {new_rule_signatures}")
+
+        return rules_changed
+
+    def add_custom_firewall_rules(self, container_id: str, container_name: str,
+                                 custom_ports: List[Dict], networks: Dict):
+        """为容器的自定义防火墙端口添加规则"""
+        # 使用特殊的ID来区分自定义防火墙规则
+        custom_rule_id = f"{container_id}_custom"
+
+        # 检查是否需要更新规则
+        if custom_rule_id in self.active_service_rules:
+            # 比较现有规则与新配置，如果有变化则先移除旧规则
+            if self._custom_firewall_rules_changed(custom_rule_id, custom_ports, networks):
+                self.logger.info(f"检测到容器 {container_name} 自定义防火墙配置变化，更新规则")
+                self.remove_service_rules(custom_rule_id)
+            else:
+                self.logger.debug(f"容器 {container_name} 自定义防火墙规则无变化，跳过")
+                return
+
+        rules = []
+
+        # 处理每个网络接口
+        for network_name, network_info in networks.items():
+            if not self._should_monitor_network(network_name):
+                continue
+
+            ipv6_address = network_info.get('GlobalIPv6Address')
+            if not ipv6_address:
+                continue
+
+            # 处理自定义防火墙端口
+            for port_info in custom_ports:
+                protocol = port_info.get('protocol', 'tcp')
+                external_port = port_info.get('external_port')
+                internal_port = port_info.get('internal_port')
+
+                if external_port and internal_port:
+                    # 处理all协议（创建tcp和udp两条规则）
+                    protocols_to_process = ['tcp', 'udp'] if protocol == 'all' else [protocol]
+
+                    for actual_protocol in protocols_to_process:
+                        if external_port != internal_port:
+                            # 需要NAT规则（端口不同）
+                            rule = ServiceRule(
+                                service_id=custom_rule_id,
+                                service_name=f"{container_name}_custom",
+                                container_id=container_id,
+                                container_name=container_name,
+                                protocol=actual_protocol,
+                                published_port=external_port,
+                                target_port=internal_port,
+                                container_ipv6=ipv6_address,
+                                interface_in=self.config.parent_interface,
+                                interface_out=self.config.gateway_macvlan
+                            )
+
+                            if self._add_service_rule(rule):
+                                rules.append(rule)
+                                self.logger.debug(f"  自定义NAT规则: {external_port}->{internal_port}/{actual_protocol}")
+                        else:
+                            # 端口相同，只需要FORWARD规则
+                            forward_rule = FirewallRule(
+                                container_id=container_id,
+                                container_name=container_name,
+                                protocol=actual_protocol,
+                                port=external_port,
+                                ipv6_address=ipv6_address,
+                                interface_in=self.config.parent_interface,
+                                interface_out=self.config.gateway_macvlan
+                            )
+
+                            if self._add_firewall_rule(forward_rule):
+                                # 将FORWARD规则也加入到service_rules中统一管理
+                                service_rule = ServiceRule(
+                                    service_id=custom_rule_id,
+                                    service_name=f"{container_name}_custom",
+                                    container_id=container_id,
+                                    container_name=container_name,
+                                    protocol=actual_protocol,
+                                    published_port=external_port,
+                                    target_port=internal_port,
+                                    container_ipv6=ipv6_address,
+                                    interface_in=self.config.parent_interface,
+                                    interface_out=self.config.gateway_macvlan
+                                )
+                                rules.append(service_rule)
+                                self.logger.debug(f"  自定义FORWARD规则: {external_port}/{actual_protocol}")
+
+        if rules:
+            self.active_service_rules[custom_rule_id] = rules
+            self.logger.info(f"为容器 {container_name} 添加了 {len(rules)} 条自定义防火墙规则")
+
+            # 记录详细的规则信息便于调试
+            for rule in rules:
+                self.logger.debug(f"  自定义规则: {rule.protocol}:{rule.published_port}->{rule.target_port} -> {rule.container_ipv6}")
+        else:
+            self.logger.debug(f"容器 {container_name} 没有生成有效自定义防火墙规则")
+
+    def _custom_firewall_rules_changed(self, custom_rule_id: str, new_custom_ports: List[Dict],
+                                      new_networks: Dict) -> bool:
+        """检测自定义防火墙规则是否发生变化"""
+        if custom_rule_id not in self.active_service_rules:
+            return True  # 没有现有规则，需要添加
+
+        existing_rules = self.active_service_rules[custom_rule_id]
+
+        # 构建新规则的特征集合用于比较
+        new_rule_signatures = set()
+        for network_name, network_info in new_networks.items():
+            if not self._should_monitor_network(network_name):
+                continue
+
+            ipv6_address = network_info.get('GlobalIPv6Address')
+            if not ipv6_address:
+                continue
+
+            for port_info in new_custom_ports:
+                protocol = port_info.get('protocol', 'tcp')
+                external_port = port_info.get('external_port')
+                internal_port = port_info.get('internal_port')
+
+                if external_port and internal_port:
+                    # 处理all协议（创建tcp和udp两个特征）
+                    protocols_to_check = ['tcp', 'udp'] if protocol == 'all' else [protocol]
+
+                    for actual_protocol in protocols_to_check:
+                        # 创建规则特征：协议_外部端口_内部端口_IPv6地址
+                        signature = f"{actual_protocol}_{external_port}_{internal_port}_{ipv6_address}"
+                        new_rule_signatures.add(signature)
+
+        # 构建现有规则的特征集合
+        existing_rule_signatures = set()
+        for rule in existing_rules:
+            signature = f"{rule.protocol}_{rule.published_port}_{rule.target_port}_{rule.container_ipv6}"
+            existing_rule_signatures.add(signature)
+
+        # 比较两个集合是否相同
+        rules_changed = new_rule_signatures != existing_rule_signatures
+
+        if rules_changed:
+            self.logger.info(f"自定义防火墙规则 {custom_rule_id} 变化检测:")
+            self.logger.info(f"  现有规则: {existing_rule_signatures}")
+            self.logger.info(f"  新规则: {new_rule_signatures}")
+
+        return rules_changed
+
     def _remove_firewall_rule(self, rule: FirewallRule) -> bool:
         """移除单条防火墙规则"""
         try:
@@ -510,8 +1012,8 @@ class FirewallManager:
         for container_id in list(self.active_rules.keys()):
             self.remove_container_rules(container_id)
 
-        # 方法2：强制清空整个链（确保彻底清理）
-        self._flush_chain()
+        # 方法2：强制清空所有链（确保彻底清理IPv4和IPv6）
+        self._flush_all_chains()
 
         # 方法3：清理IPv6基础规则
         self._cleanup_ipv6_base_rules()
@@ -538,9 +1040,15 @@ class FirewallManager:
     def add_service_rules(self, service_id: str, service_name: str,
                          service_ports: List[Dict], containers: List[Dict]):
         """为Service添加防火墙和NAT规则"""
+        # 检查是否需要更新规则
         if service_id in self.active_service_rules:
-            self.logger.debug(f"Service {service_name} 的规则已存在")
-            return
+            # 比较现有规则与新配置，如果有变化则先移除旧规则
+            if self._service_rules_changed(service_id, service_ports, containers):
+                self.logger.info(f"检测到Service {service_name} 配置变化，更新规则")
+                self.remove_service_rules(service_id)
+            else:
+                self.logger.debug(f"Service {service_name} 的规则无变化，跳过")
+                return
 
         rules = []
 
@@ -579,6 +1087,53 @@ class FirewallManager:
         if rules:
             self.active_service_rules[service_id] = rules
             self.logger.info(f"为Service {service_name} 添加了 {len(rules)} 条规则")
+
+            # 记录详细的规则信息便于调试
+            for rule in rules:
+                self.logger.debug(f"  Service规则: {rule.protocol}:{rule.published_port}->{rule.target_port} -> {rule.container_ipv6}")
+        else:
+            self.logger.debug(f"Service {service_name} 没有生成有效规则")
+
+    def _service_rules_changed(self, service_id: str, new_service_ports: List[Dict],
+                              new_containers: List[Dict]) -> bool:
+        """检测Service规则是否发生变化"""
+        if service_id not in self.active_service_rules:
+            return True  # 没有现有规则，需要添加
+
+        existing_rules = self.active_service_rules[service_id]
+
+        # 构建新规则的特征集合用于比较
+        new_rule_signatures = set()
+        for container in new_containers:
+            container_ipv6 = container.get('ipv6_address')
+            if not container_ipv6:
+                continue
+
+            for port_info in new_service_ports:
+                protocol = port_info.get('protocol', 'tcp').lower()
+                published_port = port_info.get('published_port')
+                target_port = port_info.get('target_port')
+
+                if published_port and target_port:
+                    # 创建规则特征：协议_发布端口_目标端口_容器IPv6
+                    signature = f"{protocol}_{published_port}_{target_port}_{container_ipv6}"
+                    new_rule_signatures.add(signature)
+
+        # 构建现有规则的特征集合
+        existing_rule_signatures = set()
+        for rule in existing_rules:
+            signature = f"{rule.protocol}_{rule.published_port}_{rule.target_port}_{rule.container_ipv6}"
+            existing_rule_signatures.add(signature)
+
+        # 比较两个集合是否相同
+        rules_changed = new_rule_signatures != existing_rule_signatures
+
+        if rules_changed:
+            self.logger.info(f"Service {service_id} 规则变化检测:")
+            self.logger.info(f"  现有规则: {existing_rule_signatures}")
+            self.logger.info(f"  新规则: {new_rule_signatures}")
+
+        return rules_changed
 
     def _build_service_forward_rule(self, rule: ServiceRule, action: str) -> List[str]:
         """构建Service FORWARD规则"""
@@ -715,15 +1270,18 @@ class FirewallManager:
                     known_container_ips.add(rule.ipv6_address)
                     known_container_ports.add(str(rule.port))
 
-            # 收集所有已知的Service发布端口
+            # 收集所有已知的Service IPv6地址和发布端口
+            known_service_ips = set()
             known_service_ports = set()
             for rules in self.active_service_rules.values():
                 for rule in rules:
+                    known_service_ips.add(rule.container_ipv6)
                     known_service_ports.add(str(rule.published_port))
 
             # 调试信息
             self.logger.debug(f"已知容器IP: {known_container_ips}")
             self.logger.debug(f"已知容器端口: {known_container_ports}")
+            self.logger.debug(f"已知Service IP: {known_service_ips}")
             self.logger.debug(f"已知Service端口: {known_service_ports}")
 
             # 分别统计容器规则和Service规则
@@ -753,17 +1311,14 @@ class FirewallManager:
                             self.logger.debug(f"解析规则: 目标={destination}, 端口={port}")
 
                             # 判断是容器规则还是Service规则
-                            if destination in known_container_ips:
-                                if port in known_container_ports:
-                                    container_rule_count += 1
-                                    self.logger.debug(f"识别为容器规则: {destination}:{port}")
-                                elif port in known_service_ports:
-                                    service_rule_count += 1
-                                    self.logger.debug(f"识别为Service规则: {destination}:{port}")
-                                else:
-                                    self.logger.debug(f"未识别规则（未知端口）: {destination}:{port}")
+                            if destination in known_container_ips and port in known_container_ports:
+                                container_rule_count += 1
+                                self.logger.debug(f"识别为容器规则: {destination}:{port}")
+                            elif destination in known_service_ips and port in known_service_ports:
+                                service_rule_count += 1
+                                self.logger.debug(f"识别为Service规则: {destination}:{port}")
                             else:
-                                self.logger.debug(f"未识别规则（未知地址）: {destination}:{port}")
+                                self.logger.debug(f"未识别规则: {destination}:{port}")
 
             # 统计内存中的规则数量
             memory_container_count = sum(len(rules) for rules in self.active_rules.values())

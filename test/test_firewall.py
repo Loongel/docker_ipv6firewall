@@ -41,7 +41,7 @@ def test_firewall_manager():
         # 测试添加规则
         test_networks = {
             'macvlan_ipv6_swarm': {
-                'GlobalIPv6Address': '2000:2d00:14:ccc4:ab00:1111:1000:99'
+                'GlobalIPv6Address': '2a0e:1d80:14:ccc4:ab00:1111:1000:99'
             }
         }
         test_ports = [{'port': 8080, 'protocol': 'tcp'}]

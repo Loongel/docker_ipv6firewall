@@ -359,6 +359,6 @@ python3 test/test_firewall.py
 2025-06-30 16:53:13 - INFO - Docker连接成功
 2025-06-30 16:53:13 - INFO - 发现 3 个运行中的容器
 2025-06-30 16:53:13 - INFO - 处理容器启动: test_web_macvlan
-2025-06-30 16:53:13 - INFO - 添加防火墙规则: test_web_macvlan:tcp/80 -> 2000:2d00:14:ccc4:ab00:1111:1000:3
+2025-06-30 16:53:13 - INFO - 添加防火墙规则: test_web_macvlan:tcp/80 -> 2a0e:1d80:14:ccc4:ab00:1111:1000:3
 2025-06-30 16:53:13 - INFO - 为容器 test_web_macvlan 添加了 1 条规则
 ```

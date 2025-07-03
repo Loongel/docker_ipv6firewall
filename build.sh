@@ -5,11 +5,20 @@ set -e
 
 PACKAGE_NAME="docker-ipv6-firewall"
 VERSION=$(cat VERSION)  # 从VERSION文件读取版本号
+REVISION=${1:-""}  # 可选的修订版本号，如 -2
 ARCH="amd64"
 BUILD_DIR="build"
-PACKAGE_DIR="${BUILD_DIR}/${PACKAGE_NAME}_${VERSION}_${ARCH}"
 
-echo "构建 ${PACKAGE_NAME} v${VERSION} for ${ARCH}"
+# 如果有修订版本号，添加到版本中
+if [ -n "$REVISION" ]; then
+    FULL_VERSION="${VERSION}${REVISION}"
+else
+    FULL_VERSION="${VERSION}"
+fi
+
+PACKAGE_DIR="${BUILD_DIR}/${PACKAGE_NAME}_${FULL_VERSION}_${ARCH}"
+
+echo "构建 ${PACKAGE_NAME} v${FULL_VERSION} for ${ARCH}"
 
 # 清理之前的构建
 rm -rf ${BUILD_DIR}
@@ -23,7 +32,7 @@ mkdir -p ${PACKAGE_DIR}/etc/systemd/system
 mkdir -p ${PACKAGE_DIR}/var/log
 
 # 动态生成control文件（替换版本号）
-sed "s/Version: .*/Version: ${VERSION}/" debian/control > ${PACKAGE_DIR}/DEBIAN/control
+sed "s/Version: .*/Version: ${FULL_VERSION}/" debian/control > ${PACKAGE_DIR}/DEBIAN/control
 cp debian/postinst ${PACKAGE_DIR}/DEBIAN/
 cp debian/prerm ${PACKAGE_DIR}/DEBIAN/
 cp debian/postrm ${PACKAGE_DIR}/DEBIAN/
@@ -48,12 +57,12 @@ echo "创建Debian包..."
 dpkg-deb --build ${PACKAGE_DIR}
 
 # 移动到当前目录
-mv ${BUILD_DIR}/${PACKAGE_NAME}_${VERSION}_${ARCH}.deb .
+mv ${BUILD_DIR}/${PACKAGE_NAME}_${FULL_VERSION}_${ARCH}.deb .
 
-echo "构建完成: ${PACKAGE_NAME}_${VERSION}_${ARCH}.deb"
+echo "构建完成: ${PACKAGE_NAME}_${FULL_VERSION}_${ARCH}.deb"
 echo ""
 echo "安装命令:"
-echo "sudo dpkg -i ${PACKAGE_NAME}_${VERSION}_${ARCH}.deb"
+echo "sudo dpkg -i ${PACKAGE_NAME}_${FULL_VERSION}_${ARCH}.deb"
 echo ""
 echo "如果有依赖问题，运行:"
 echo "sudo apt-get install -f"
