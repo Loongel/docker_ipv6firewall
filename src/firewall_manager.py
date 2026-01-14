@@ -352,6 +352,18 @@ class FirewallManager:
         except Exception as e:
             self.logger.warning(f"清理容器隔离规则时出错: {e}")
 
+    def _flush_chain(self):
+        """清空主FORWARD链中的所有规则"""
+        try:
+            # 清空链中的所有规则
+            result = subprocess.run([self.config.ip6tables_cmd, "-F", self.config.chain_name], capture_output=True, text=True)
+            if result.returncode == 0:
+                self.logger.info(f"已清空防火墙链 {self.config.chain_name} 中的所有规则")
+            else:
+                self.logger.warning(f"清空防火墙链失败: {result.stderr}")
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"清空防火墙链失败: {e}")
+
     def _flush_all_chains(self):
         """清空所有专用链中的规则"""
         # 清空IPv6 FORWARD专用链
