@@ -55,8 +55,14 @@ cd docker_ipv6firewall
 chmod +x build.sh ./scripts/install.sh 
 sudo ./scripts/install.sh
 
+# 配置参数
+  编辑配置: nano /etc/docker-ipv6-firewall/config.yaml
+  重启服务: systemctl restart docker-ipv6-firewall
+
 # 检查状态
-sudo systemctl status docker-ipv6-firewall
+  查看状态: systemctl status docker-ipv6-firewall
+  查看日志: journalctl -u docker-ipv6-firewall -f
+  查看规则: ip6tables -L DOCKER_IPV6_FORWARD -n -v
 ```
 
 ### 方法二：手动构建安装
