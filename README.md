@@ -368,4 +368,31 @@ python3 test/test_firewall.py
 2025-06-30 16:53:13 - INFO - 处理容器启动: test_web_macvlan
 2025-06-30 16:53:13 - INFO - 添加防火墙规则: test_web_macvlan:tcp/80 -> 2a0e:1d80:14:ccc4:ab00:1111:1000:3
 2025-06-30 16:53:13 - INFO - 为容器 test_web_macvlan 添加了 1 条规则
+2025-06-30 16:53:13 - INFO - 为容器 test_web_macvlan 添加了 1 条规则
+```
+
+## 📚 详细文档
+
+为了保持文档清晰，详细的功能说明和开发指南已移除至独立文档：
+
+- [**高级功能特性 (FEATURES.md)**](docs/FEATURES.md)
+    - Swarm Worker 支持
+    - 独占模式 (Exclusive Mode)
+    - 安全隔离策略
+- [**开发与维护记录 (DEV_NOTES.md)**](docs/DEV_NOTES.md)
+    - 版本演进历史
+    - 已知问题
+    - AI 协作上下文
+
+## 🛠️ 快速排查
+
+### 常见问题
+1. **规则重复**：请确保升级到 v1.4.2+，已修复容器/Service规则冲突问题。
+2. **规则未生效**：检查容器是否启用了 `docker-ipv6-firewall.ports` 标签，如有，则原生端口会被忽略。
+
+### 查看防火墙规则
+```bash
+sudo ip6tables -L DOCKER_IPV6FW_FORWARD -n -v
+# 或者查看 NAT 表
+sudo ip6tables -t nat -L -n -v
 ```

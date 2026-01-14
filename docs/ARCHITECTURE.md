@@ -44,6 +44,19 @@ Docker容器 (macvlan网络中的容器)
 - 有明确的物理接口和 macvlan 网关接口
 - 需要从外网访问容器服务的场景
 
+### Swarm 集群适配
+
+针对 Docker Swarm 环境，系统实现了以下适配逻辑：
+
+1. **工作节点降级 (Worker Degrade)**:
+    - 无法访问管理平面 API (docker service inspect) 时，自动回退。
+    - 采用 "Local Discovery" 机制，扫描本地容器及其 Label (`com.docker.swarm.service.*`)。
+
+2. **冲突解决 (Conflict Resolution - Exclusive Mode)**:
+    - **问题**: 原生 PortBinding 与自定义 Label 可能冲突。
+    - **策略**: 标签优先 (Label Priority)。如果存在 `docker-ipv6-firewall.ports` 标签，则完全忽略原生端口映射。
+
+
 ## 系统架构
 
 ### 模块组成

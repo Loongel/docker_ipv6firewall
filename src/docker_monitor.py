@@ -87,7 +87,12 @@ class DockerMonitor:
                     
                 if event.get('Type') == 'container':
                     action = event.get('Action')
-                    container_id = event.get('id')
+                    # 尝试多种方式获取ID
+                    container_id = event.get('id') or event.get('Actor', {}).get('ID')
+
+                    if not container_id:
+                        self.logger.debug(f"收到无ID的容器事件: {action} (忽略)")
+                        continue
 
                     if action == 'start':
                         self.logger.debug(f"容器启动事件: {container_id}")
@@ -98,7 +103,10 @@ class DockerMonitor:
 
                 elif event.get('Type') == 'service':
                     action = event.get('Action')
-                    service_id = event.get('id')
+                    service_id = event.get('id') or event.get('Actor', {}).get('ID')
+
+                    if not service_id:
+                        continue
 
                     if action == 'remove':
                         self.logger.debug(f"Service删除事件: {service_id}")
@@ -178,7 +186,8 @@ class DockerMonitor:
                         )
 
                     # 处理自定义防火墙端口
-                    if port_info['custom_ports']:
+                    # FIX: 如果是Service容器，跳过此处处理，交由 Service 逻辑处理 (避免重复规则)
+                    if port_info['custom_ports'] and not service_name:
                         self.firewall_manager.add_custom_firewall_rules(
                             container_id,
                             container_info['name'],
@@ -243,7 +252,7 @@ class DockerMonitor:
             for container in self.client.containers.list(all=True):
                 existing_containers.add(container.id)
 
-            # 清理不存在的容器规则
+            # 1. 清理不存在的容器规则
             stale_container_ids = []
             for container_id in self.firewall_manager.active_rules.keys():
                 if container_id not in existing_containers:
@@ -253,25 +262,49 @@ class DockerMonitor:
                 self.logger.info(f"清理陈旧容器规则: {container_id}")
                 self.firewall_manager.remove_container_rules(container_id)
 
-            # 获取当前存在的Service ID
-            existing_services = set()
-            # 注意：client.services.list() 需要 manager 权限，在非 manager 环境这里可能抛异常
-            try:
-                for service in self.client.services.list():
-                    existing_services.add(service.id)
-            except Exception:
-                # 无法列出 services（可能没有 manager 权限），通过 active_service_rules 保持内存记录
-                self.logger.debug("无法列出 services（可能非 manager 或权限不足），跳过 service 存在性检查")
+            # 2. 清理陈旧的Service规则
+            # 逻辑：检查Service规则关联的容器是否存在于本节点
+            # 这比检查 service exists globally 更准确，且不依赖 Manager 权限
+            services_to_remove = []
+            services_to_update = {}  # service_id -> valid_rules
 
-            # 清理不存在的Service规则
-            stale_service_ids = []
-            for service_id in self.firewall_manager.active_service_rules.keys():
-                if existing_services and service_id not in existing_services:
-                    stale_service_ids.append(service_id)
+            for service_id, rules in self.firewall_manager.active_service_rules.items():
+                valid_rules = []
+                has_changes = False
+                
+                for rule in rules:
+                    if rule.container_id in existing_containers:
+                        valid_rules.append(rule)
+                    else:
+                        has_changes = True
 
-            for service_id in stale_service_ids:
-                self.logger.info(f"清理陈旧Service规则: {service_id}")
+                if not valid_rules:
+                    services_to_remove.append(service_id)
+                elif has_changes:
+                    services_to_update[service_id] = valid_rules
+
+            # 执行删除
+            for service_id in services_to_remove:
+                self.logger.info(f"清理陈旧Service所有规则 (容器已全部消失): {service_id}")
                 self.firewall_manager.remove_service_rules(service_id)
+
+            # 执行更新
+            for service_id, valid_rules in services_to_update.items():
+                self.logger.info(f"更新Service规则 (清理部分消失的容器): {service_id}, 剩余规则数: {len(valid_rules)}")
+                
+                # 移除旧的 invalid rules
+                old_rules = self.firewall_manager.active_service_rules[service_id]
+                for rule in old_rules:
+                    if rule not in valid_rules:
+                        try:
+                            # 尝试使用内部方法移除单条规则
+                            if hasattr(self.firewall_manager, '_remove_service_rule'):
+                                self.firewall_manager._remove_service_rule(rule)
+                        except Exception as e:
+                            self.logger.error(f"移除单条陈旧Service规则失败: {e}")
+
+                # 更新内存状态
+                self.firewall_manager.active_service_rules[service_id] = valid_rules
 
         except Exception as e:
             self.logger.error(f"清理陈旧规则失败: {e}")
@@ -676,6 +709,28 @@ class DockerMonitor:
         derived_ports = []
         signatures = set()
         try:
+            # 1. 首先尝试获取自定义端口 (Exclusive Mode check)
+            custom_ports = self._get_service_custom_ports(service_name)
+            if custom_ports:
+                self.logger.info(f"Service {service_name} 使用自定义端口配置 (Exclusive Mode)，忽略原生容器端口: {custom_ports}")
+                # 转换格式以匹配 derived_ports 的结构 (如果 needed, 但 _extract_service_ports 会直接处理 custom_ports return)
+                # 实际上 _extract_service_ports 调用此时，期望返回 List[Dict] compatible with standard port objects
+                # custom_ports from _get_service_custom_ports returns: 
+                # [{'internal_port': 8080, 'external_port': 5443, 'protocol': 'tcp', 'type': 'custom_firewall'}]
+                # derived_ports expects:
+                # {'protocol': 'tcp', 'published_port': 5443, 'target_port': 8080, 'publish_mode': 'derived'}
+                
+                # 适配转换:
+                for cp in custom_ports:
+                    derived_ports.append({
+                        'protocol': cp['protocol'],
+                        'published_port': cp['external_port'],
+                        'target_port': cp['internal_port'],
+                        'publish_mode': 'custom_label_exclusive'
+                    })
+                return derived_ports
+
+            # 2. 如果没有自定义端口，则扫描容器原生端口
             service_containers = self.client.containers.list(filters={'label': f'com.docker.swarm.service.name={service_name}'})
             for container in service_containers:
                 info = self._get_container_info(container)
@@ -707,16 +762,17 @@ class DockerMonitor:
                             except Exception:
                                 host_port = None
 
-                        published = host_port if host_port and host_port > 0 else target_port
-                        sig = f"{protocol}_{published}_{target_port}"
-                        if sig not in signatures:
-                            signatures.add(sig)
-                            derived_ports.append({
-                                'protocol': protocol,
-                                'published_port': published,
-                                'target_port': target_port,
-                                'publish_mode': 'derived'
-                            })
+                        if host_port and host_port > 0:
+                            published = host_port
+                            sig = f"{protocol}_{published}_{target_port}"
+                            if sig not in signatures:
+                                signatures.add(sig)
+                                derived_ports.append({
+                                    'protocol': protocol,
+                                    'published_port': published,
+                                    'target_port': target_port,
+                                    'publish_mode': 'derived'
+                                })
 
                 # 如果没有 PortBindings，再尝试 NetworkSettings.Ports（运行时）
                 elif network_ports:
@@ -741,16 +797,17 @@ class DockerMonitor:
                                 except Exception:
                                     continue
 
-                        published = host_port if host_port and host_port > 0 else target_port
-                        sig = f"{protocol}_{published}_{target_port}"
-                        if sig not in signatures:
-                            signatures.add(sig)
-                            derived_ports.append({
-                                'protocol': protocol,
-                                'published_port': published,
-                                'target_port': target_port,
-                                'publish_mode': 'derived'
-                            })
+                        if host_port and host_port > 0:
+                            published = host_port
+                            sig = f"{protocol}_{published}_{target_port}"
+                            if sig not in signatures:
+                                signatures.add(sig)
+                                derived_ports.append({
+                                    'protocol': protocol,
+                                    'published_port': published,
+                                    'target_port': target_port,
+                                    'publish_mode': 'derived'
+                                })
 
             return derived_ports
         except Exception as e:

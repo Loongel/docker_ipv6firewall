@@ -701,7 +701,8 @@ class FirewallManager:
                 "--dport", str(rule.port),  # 特定端口
                 "-i", rule.interface_in,   # 从外网接口进入
                 "-o", rule.interface_out,  # 到macvlan接口
-                "-j", "ACCEPT"
+                "-j", "ACCEPT",
+                "-m", "comment", "--comment", f"Container:{rule.container_name}"
             ]
 
             # 检查规则是否已存在
@@ -1035,7 +1036,8 @@ class FirewallManager:
                 "--dport", str(rule.port),
                 "-i", rule.interface_in,
                 "-o", rule.interface_out,
-                "-j", "ACCEPT"
+                "-j", "ACCEPT",
+                "-m", "comment", "--comment", f"Container:{rule.container_name}"
             ]
 
             # 先检查规则是否存在
@@ -1124,7 +1126,7 @@ class FirewallManager:
                         service_id=service_id,
                         service_name=service_name,
                         container_id=container_id,
-                        container_name=container_name,
+                        container_name=container_name[:20], # 截断以避免过长
                         protocol=protocol,  # 动态协议，不写死
                         published_port=published_port,
                         target_port=target_port,
@@ -1189,14 +1191,17 @@ class FirewallManager:
 
     def _build_service_forward_rule(self, rule: ServiceRule, action: str) -> List[str]:
         """构建Service FORWARD规则"""
+        # 注意: FORWARD链是在PREROUTING(DNAT)之后处理的
+        # 因此这里需要匹配转换后的目标端口(target_port)，而不是发布端口(published_port)
         return [
             action, self.config.chain_name,
             "-p", rule.protocol,
             "-d", rule.container_ipv6,  # 添加目标地址
-            "--dport", str(rule.published_port),
+            "--dport", str(rule.target_port), #这是修复点
             "-i", rule.interface_in,
             "-o", rule.interface_out,
-            "-j", "ACCEPT"
+            "-j", "ACCEPT",
+            "-m", "comment", "--comment", f"Svc:{rule.service_name} {rule.published_port}->{rule.target_port}"
         ]
 
     def _build_service_nat_rule(self, rule: ServiceRule, action: str) -> List[str]:
@@ -1209,7 +1214,8 @@ class FirewallManager:
             "-p", rule.protocol,
             "--dport", str(rule.published_port),
             "-j", "DNAT",
-            "--to-destination", f"[{rule.container_ipv6}]:{rule.target_port}"
+            "--to-destination", f"[{rule.container_ipv6}]:{rule.target_port}",
+            "-m", "comment", "--comment", f"Svc:{rule.service_name} {rule.published_port}->{rule.target_port}"
         ]
 
     def _add_service_rule(self, rule: ServiceRule) -> bool:

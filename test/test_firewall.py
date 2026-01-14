@@ -25,6 +25,7 @@ def test_config():
     print(f"  网关接口: {config.gateway_macvlan}")
     print(f"  监控网络: {config.monitored_networks}")
     print("✓ 配置加载成功")
+    return True
 
 
 def test_firewall_manager():

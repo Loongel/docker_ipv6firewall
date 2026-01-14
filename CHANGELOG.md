@@ -1,11 +1,25 @@
-# Changelog
+## [1.4.2] - 2026-01-15
 
-All notable changes to this project will be documented in this file.
+### Fixed
+- **Duplicate Rules**: 修复了 Swarm Service 容器同时触发 Service 规则和自定义规则导致重复添加的问题。现在检测到 Service 上下文时会自动跳过自定义规则处理。
+- **Comment Position**: 调整了 `iptables` 命令参数顺序，将 `--comment` 移至链表操作的末尾，以改善查看输出时的可读性。
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+### Documentation
+- 重构了文档结构，将高级特性移至 `docs/FEATURES.md`。
+- 新增 `docs/DEV_NOTES.md` 记录开发上下文。
 
-## [Unreleased]
+
+
+### Added
+- **Swarm Worker Node Support**: 实现了优雅降级机制，支持在无 Manager 权限的节点上运行。当 `docker service inspect` 失败时，自动切换到基于本地容器 Labels 的信息推导模式。
+- **Exclusive Mode (独占模式)**: 新增冲突解决策略。当检测到 `docker-ipv6-firewall.ports` 标签时，自动忽略容器所有原生的端口映射，仅使用标签定义的规则。这提供了更精确的端口暴露控制。
+- **Rule Comments**: 为生成的 `ip6tables` 规则添加了 `--comment`，清晰标识每条规则所属的 Service 或容器名称及端口映射关系。
+
+### Fixed
+- **Forward Chain Port Logic**: 修复了 Service 规则中 FORWARD 链使用外部端口导致数据包被丢弃的严重 Bug。现在正确使用 DNAT 后的目标端口 (Internal Port)。
+- **Startup Sync**: 优化了规则同步逻辑，解决了重启服务时偶发的规则重复问题。
+
+
 
 ### Planned
 - 更多网络驱动支持
