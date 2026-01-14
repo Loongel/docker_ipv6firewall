@@ -225,92 +225,132 @@ class FirewallManager:
             raise
 
     def _ensure_container_isolation_rules(self):
-        """确保容器隔离规则存在 - 阻止容器访问主机本地服务"""
+        """
+                    确保容器隔离规则存在。
+                    改动：
+        1. 添加 DOCKER_IPV6FW_ISO 隔离链接，用于禁止子网访问主机接口
+        2. DOCKER_IPV6FW_ISO 隔离链可以手动添加豁免规则，不会被IPV6FW清除，可添加 netbird 的dns服务等
+           如: 
+             iptables -I DOCKER_IPV6FW_ISO -i macvlan_gw -p udp -m addrtype --dst-type LOCAL -m udp --dport 53 -j ACCEPT
+
+             ip6tables -I DOCKER_IPV6FW_ISO -i macvlan_gw -p udp -m addrtype --dst-type LOCAL -m udp --dport 53 -j ACCEPT
+        """
+
+        iso_chain = "DOCKER_IPV6FW_ISO"
+
         try:
-            # IPv4容器隔离规则 - 使用正确的协议否定语法
-            ipv4_isolation_check = subprocess.run([
+            # ======================= IPv4 处理 =======================
+            # 1. 尝试创建自定义链 (如果存在会报错，忽略即可)
+            subprocess.run([self.config.iptables_cmd, "-N", iso_chain], 
+                           check=False, capture_output=True)
+
+            # 2. 确保 INPUT 链跳转到自定义链 
+            # 规则：-j DOCKER_IPV6FW_ISO
+            ipv4_jump_check = subprocess.run([
                 self.config.iptables_cmd, "-C", "INPUT",
+                "-j", iso_chain
+            ], capture_output=True, text=True)
+
+            if ipv4_jump_check.returncode != 0:
+                # 插入到第1位，确保优先执行
+                subprocess.run([
+                    self.config.iptables_cmd, "-I", "INPUT", "1",
+                    "-j", iso_chain
+                ], check=True)
+                self.logger.info(f"添加IPv4隔离链跳转: INPUT -> {iso_chain} (无网卡限制)")
+
+            # 3. 确保自定义链尾部存在“兜底”隔离规则
+            # 规则：-i <macvlan> ! -p icmp -m addrtype --dst-type LOCAL -j DROP
+            ipv4_drop_check = subprocess.run([
+                self.config.iptables_cmd, "-C", iso_chain,
                 "-i", self.config.gateway_macvlan,
                 "!", "-p", "icmp",
                 "-m", "addrtype", "--dst-type", "LOCAL",
                 "-j", "DROP"
             ], capture_output=True, text=True)
 
-            if ipv4_isolation_check.returncode != 0:
+            if ipv4_drop_check.returncode != 0:
                 subprocess.run([
-                    self.config.iptables_cmd, "-I", "INPUT", "1",
+                    self.config.iptables_cmd, "-A", iso_chain,
                     "-i", self.config.gateway_macvlan,
                     "!", "-p", "icmp",
                     "-m", "addrtype", "--dst-type", "LOCAL",
                     "-j", "DROP"
                 ], check=True)
-                self.logger.info("添加IPv4容器隔离规则 - 阻止容器访问主机本地服务（插入到第1位）")
+                self.logger.info(f"在 {iso_chain} 尾部添加IPv4默认隔离规则 (限制来源: {self.config.gateway_macvlan})")
             else:
-                self.logger.debug("IPv4容器隔离规则已存在")
+                self.logger.debug(f"IPv4默认隔离规则已存在于 {iso_chain}")
 
-            # IPv6容器隔离规则 - 使用正确的协议否定语法
-            ipv6_isolation_check = subprocess.run([
+            # ======================= IPv6 处理 =======================
+            # 1. 尝试创建自定义链
+            subprocess.run([self.config.ip6tables_cmd, "-N", iso_chain], 
+                           check=False, capture_output=True)
+
+            # 2. 确保在INPUT链第一行插入链跳转 
+            ipv6_jump_check = subprocess.run([
                 self.config.ip6tables_cmd, "-C", "INPUT",
+                "-j", iso_chain
+            ], capture_output=True, text=True)
+
+            if ipv6_jump_check.returncode != 0:
+                subprocess.run([
+                    self.config.ip6tables_cmd, "-I", "INPUT", "1",
+                    "-j", iso_chain
+                ], check=True)
+                self.logger.info(f"添加IPv6隔离链跳转: INPUT -> {iso_chain} (无网卡限制)")
+
+            # 3. 确保自定义链尾部存在“兜底”隔离规则
+            # 关键改动：在这里限制 -i gateway_macvlan
+            ipv6_drop_check = subprocess.run([
+                self.config.ip6tables_cmd, "-C", iso_chain,
                 "-i", self.config.gateway_macvlan,
                 "!", "-p", "ipv6-icmp",
                 "-m", "addrtype", "--dst-type", "LOCAL",
                 "-j", "DROP"
             ], capture_output=True, text=True)
 
-            if ipv6_isolation_check.returncode != 0:
+            if ipv6_drop_check.returncode != 0:
                 subprocess.run([
-                    self.config.ip6tables_cmd, "-I", "INPUT", "1",
+                    self.config.ip6tables_cmd, "-A", iso_chain,
                     "-i", self.config.gateway_macvlan,
                     "!", "-p", "ipv6-icmp",
                     "-m", "addrtype", "--dst-type", "LOCAL",
                     "-j", "DROP"
                 ], check=True)
-                self.logger.info("添加IPv6容器隔离规则 - 阻止容器访问主机本地服务（插入到第1位）")
+                self.logger.info(f"在 {iso_chain} 尾部添加IPv6默认隔离规则 (限制来源: {self.config.gateway_macvlan})")
             else:
-                self.logger.debug("IPv6容器隔离规则已存在")
+                self.logger.debug(f"IPv6默认隔离规则已存在于 {iso_chain}")
 
         except subprocess.CalledProcessError as e:
             self.logger.error(f"确保容器隔离规则失败: {e}")
             raise
 
     def _cleanup_container_isolation_rules(self):
-        """清理容器隔离规则"""
+        """
+        清理容器隔离规则。
+        逻辑：仅删除 INPUT 链中对自定义链的引用，保留自定义链本身以保存用户豁免规则。
+        """
+        iso_chain = "DOCKER_IPV6FW_ISO"
+
         try:
-            # 清理IPv4容器隔离规则
+            # 清理 IPv4 INPUT 跳转规则 (注意：查找时不带 -i 参数)
             subprocess.run([
                 self.config.iptables_cmd, "-D", "INPUT",
-                "-i", self.config.gateway_macvlan,
-                "!", "-p", "icmp",
-                "-m", "addrtype", "--dst-type", "LOCAL",
-                "-j", "DROP"
+                "-j", iso_chain
             ], check=False, capture_output=True)
-            self.logger.debug("清理IPv4容器隔离规则")
+            self.logger.debug(f"移除 IPv4 INPUT 链对 {iso_chain} 的引用")
 
-            # 清理IPv6容器隔离规则
+            # 清理 IPv6 INPUT 跳转规则
             subprocess.run([
                 self.config.ip6tables_cmd, "-D", "INPUT",
-                "-i", self.config.gateway_macvlan,
-                "!", "-p", "ipv6-icmp",
-                "-m", "addrtype", "--dst-type", "LOCAL",
-                "-j", "DROP"
+                "-j", iso_chain
             ], check=False, capture_output=True)
-            self.logger.debug("清理IPv6容器隔离规则")
+            self.logger.debug(f"移除 IPv6 INPUT 链对 {iso_chain} 的引用")
+            
+            # 不删除链本身，保留用户自定义规则
 
         except Exception as e:
             self.logger.warning(f"清理容器隔离规则时出错: {e}")
-
-    def _flush_chain(self):
-        """清空主FORWARD链中的所有规则"""
-        try:
-            # 清空链中的所有规则
-            result = subprocess.run([self.config.ip6tables_cmd, "-F", self.config.chain_name],
-                                  capture_output=True, text=True)
-            if result.returncode == 0:
-                self.logger.info(f"已清空防火墙链 {self.config.chain_name} 中的所有规则")
-            else:
-                self.logger.warning(f"清空防火墙链失败: {result.stderr}")
-        except subprocess.CalledProcessError as e:
-            self.logger.error(f"清空防火墙链失败: {e}")
 
     def _flush_all_chains(self):
         """清空所有专用链中的规则"""
