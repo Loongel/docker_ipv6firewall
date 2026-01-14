@@ -48,10 +48,11 @@
 
 ```bash
 # 克隆项目
-git clone <repository-url>
-cd docker-ipv6-firewall
+git clone https://github.com/Loongel/docker_ipv6firewall.git 
+cd docker_ipv6firewall 
 
 # 运行安装脚本
+chmod +x build.sh ./scripts/install.sh 
 sudo ./scripts/install.sh
 
 # 检查状态
