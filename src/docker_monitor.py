@@ -8,6 +8,7 @@ import logging
 import subprocess
 import threading
 import time
+import json
 from typing import Dict, List, Any
 
 
@@ -159,6 +160,7 @@ class DockerMonitor:
                 service_name = labels.get('com.docker.swarm.service.name')
 
                 # 如果是Service容器，尝试从Service配置中获取自定义防火墙端口
+                # 优先使用容器自身的 labels（允许在非 manager 环境下工作）
                 if service_name and not port_info['custom_ports']:
                     service_custom_ports = self._get_service_custom_ports(service_name)
                     if service_custom_ports:
@@ -253,13 +255,18 @@ class DockerMonitor:
 
             # 获取当前存在的Service ID
             existing_services = set()
-            for service in self.client.services.list():
-                existing_services.add(service.id)
+            # 注意：client.services.list() 需要 manager 权限，在非 manager 环境这里可能抛异常
+            try:
+                for service in self.client.services.list():
+                    existing_services.add(service.id)
+            except Exception:
+                # 无法列出 services（可能没有 manager 权限），通过 active_service_rules 保持内存记录
+                self.logger.debug("无法列出 services（可能非 manager 或权限不足），跳过 service 存在性检查")
 
             # 清理不存在的Service规则
             stale_service_ids = []
             for service_id in self.firewall_manager.active_service_rules.keys():
-                if service_id not in existing_services:
+                if existing_services and service_id not in existing_services:
                     stale_service_ids.append(service_id)
 
             for service_id in stale_service_ids:
@@ -307,14 +314,14 @@ class DockerMonitor:
             network_ports = container_info.get('network_settings', {}).get('Ports', {})
 
             # 3. 检查是否为Service容器和自定义防火墙配置
-            labels = container_info.get('config', {}).get('Labels', {})
+            labels = container_info.get('config', {}).get('Labels', {}) or {}
             is_service_container = 'com.docker.swarm.service.name' in labels
 
             # 检查自定义防火墙Labels
             custom_firewall_ports = self._extract_custom_firewall_ports(labels)
 
             self.logger.debug(f"端口提取 - 网络模式: {network_mode}, Service容器: {is_service_container}")
-            self.logger.debug(f"端口绑定: {list(port_bindings.keys())}")
+            self.logger.debug(f"端口绑定: {list(port_bindings.keys()) if port_bindings else []}")
 
             # 4. 处理Public端口映射（优先级最高）
             public_port_set = set()
@@ -445,25 +452,53 @@ class DockerMonitor:
         return custom_ports
 
     def _get_service_custom_ports(self, service_name: str) -> List[Dict[str, Any]]:
-        """从Service配置中获取自定义防火墙端口"""
+        """从Service配置中获取自定义防火墙端口
+        最小降级策略：
+        1) 优先从本节点属于该service的容器 labels 中读取 docker-ipv6-firewall.ports
+        2) 若本地容器没有此 label，再尝试调用 docker service inspect（可能需要 manager 权限）
+        """
         try:
-            # 获取Service配置
+            # 1) 优先从本节点容器读取 labels（不需要 manager 权限）
+            try:
+                service_containers = self.client.containers.list(
+                    filters={'label': f'com.docker.swarm.service.name={service_name}'}
+                )
+                collected = []
+                for container in service_containers:
+                    info = self._get_container_info(container)
+                    if not info:
+                        continue
+                    labels = info.get('config', {}).get('Labels', {}) or {}
+                    ports_cfg = labels.get('docker-ipv6-firewall.ports', '')
+                    if ports_cfg:
+                        # 解析并返回（聚合多个容器的 labels）
+                        parsed = self._extract_custom_firewall_ports(labels)
+                        for p in parsed:
+                            if p not in collected:
+                                collected.append(p)
+                if collected:
+                    self.logger.debug(f"从本地容器 labels 获取到自定义端口: {collected}")
+                    return collected
+            except Exception as e:
+                # 本地容器读取也可能失败（非常少见），继续尝试 service inspect
+                self.logger.debug(f"尝试从本地容器 labels 获取自定义端口失败: {e}")
+
+            # 2) 回退到 docker service inspect（可能需要 manager 权限）
             result = subprocess.run(
                 ['docker', 'service', 'inspect', service_name, '--format', '{{ json .Spec.TaskTemplate.ContainerSpec.Labels }}'],
                 capture_output=True, text=True, timeout=10
             )
 
             if result.returncode != 0:
-                self.logger.warning(f"无法获取Service {service_name} 配置: {result.stderr}")
+                self.logger.warning(f"无法获取Service {service_name} 配置 via `docker service inspect`: {result.stderr.strip()}")
                 return []
 
-            # 解析Service Labels
-            import json
-            service_labels = json.loads(result.stdout.strip())
-
-            # 提取自定义防火墙端口配置
+            service_labels = json.loads(result.stdout.strip() or "{}")
             return self._extract_custom_firewall_ports(service_labels)
 
+        except subprocess.CalledProcessError as e:
+            self.logger.warning(f"调用 docker service inspect 失败（可能权限不足）: {e}")
+            return []
         except Exception as e:
             self.logger.error(f"获取Service {service_name} 自定义端口失败: {e}")
             return []
@@ -482,32 +517,24 @@ class DockerMonitor:
             self.logger.error(f"处理现有Services失败: {e}")
 
     def _get_local_services(self) -> List[str]:
-        """获取本节点的Services"""
+        """获取本节点的Services
+        改进：不再解析容器名，优先从容器 labels 中读取 com.docker.swarm.service.name
+        （避免 service 名含 '.' 导致解析错误）
+        """
+        service_names = []
         try:
-            # 使用你提供的命令获取本节点Services
-            import subprocess
-            result = subprocess.run([
-                'docker', 'ps',
-                '--filter', 'label=com.docker.swarm.service.name',
-                '--format', '{{.Names}}'
-            ], capture_output=True, text=True, check=True)
-
-            if result.stdout.strip():
-                # 提取service名称（去掉实例后缀）
-                service_names = []
-                for line in result.stdout.strip().split('\n'):
-                    service_name = line.split('.')[0]
-                    if service_name not in service_names:
-                        service_names.append(service_name)
-                return service_names
-            else:
-                return []
-
-        except subprocess.CalledProcessError as e:
-            self.logger.error(f"获取本节点Services失败: {e}")
-            return []
+            containers = self.client.containers.list(filters={'label': 'com.docker.swarm.service.name'}, all=True)
+            for c in containers:
+                info = self._get_container_info(c)
+                if not info:
+                    continue
+                labels = info.get('config', {}).get('Labels', {}) or {}
+                svc = labels.get('com.docker.swarm.service.name')
+                if svc and svc not in service_names:
+                    service_names.append(svc)
+            return service_names
         except Exception as e:
-            self.logger.error(f"解析Services列表失败: {e}")
+            self.logger.error(f"获取本节点Services失败: {e}")
             return []
 
     def _handle_service_update(self, service_name: str):
@@ -521,7 +548,7 @@ class DockerMonitor:
             # 获取Service的端口配置
             service_ports = self._extract_service_ports(service_info)
             if not service_ports:
-                self.logger.debug(f"Service {service_name} 没有发布端口")
+                self.logger.debug(f"Service {service_name} 没有发布端口（或无法获取published ports）")
                 return
 
             # 获取Service对应的本节点容器
@@ -540,7 +567,7 @@ class DockerMonitor:
 
             # 添加Service规则
             self.firewall_manager.add_service_rules(
-                service_info['id'],
+                service_info.get('id', service_name),
                 service_name,
                 service_ports,
                 service_containers
@@ -550,14 +577,14 @@ class DockerMonitor:
             self.logger.error(f"处理Service {service_name} 失败: {e}")
 
     def _get_service_info(self, service_name: str) -> Dict[str, Any]:
-        """获取Service详细信息"""
+        """获取Service详细信息
+        降级策略：优先通过 docker service inspect 获取（最完整），失败时从本地容器 labels 中组合一个最小信息结构。
+        """
         try:
-            import subprocess
             result = subprocess.run([
                 'docker', 'service', 'inspect', service_name
-            ], capture_output=True, text=True, check=True)
+            ], capture_output=True, text=True, check=True, timeout=10)
 
-            import json
             service_data = json.loads(result.stdout)[0]
 
             return {
@@ -568,38 +595,167 @@ class DockerMonitor:
             }
 
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"获取Service {service_name} 信息失败: {e}")
-            return None
+            # 可能是权限不足或非 manager 节点
+            self.logger.warning(f"无法执行 `docker service inspect {service_name}`（可能需要 manager 权限或在 manager 上运行）: {e}")
         except Exception as e:
-            self.logger.error(f"解析Service {service_name} 信息失败: {e}")
+            self.logger.warning(f"解析 docker service inspect 输出失败: {e}")
+
+        # 回退方案：从本节点容器的 labels 获取 service id/name，返回最小信息结构
+        try:
+            service_containers = self.client.containers.list(filters={'label': f'com.docker.swarm.service.name={service_name}'})
+            if not service_containers:
+                self.logger.debug(f"无法通过本地容器找到 service {service_name} 的实例")
+                return None
+
+            # 选第一个容器作为代表，尝试从 labels 中读取 service id/name
+            container = service_containers[0]
+            info = self._get_container_info(container)
+            labels = info.get('config', {}).get('Labels', {}) or {}
+            derived_id = labels.get('com.docker.swarm.service.id') or labels.get('com.docker.swarm.service.name') or service_name
+
+            self.logger.info(f"回退：使用本地容器 labels 得到 service 信息 (service={service_name}, id={derived_id})")
+            return {
+                'id': derived_id,
+                'name': service_name,
+                'endpoint': {},  # 没有 Endpoint.Ports（PublishedPort）信息
+                'spec': {}
+            }
+
+        except Exception as e:
+            self.logger.error(f"从本地容器回退获取 service 信息失败: {e}")
             return None
 
     def _extract_service_ports(self, service_info: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """提取Service端口配置"""
+        """提取Service端口配置
+        如果无法通过 service inspect 获取 Endpoint.Ports（PublishedPort），
+        则回退到从本节点容器推导出端口映射（尽量保证 core 功能）
+        """
         ports = []
 
         try:
-            endpoint_ports = service_info.get('endpoint', {}).get('Ports', [])
+            endpoint_ports = service_info.get('endpoint', {}).get('Ports', []) or []
 
-            for port in endpoint_ports:
-                # 动态获取协议，不写死
-                protocol = port.get('Protocol', 'tcp').lower()
-                published_port = port.get('PublishedPort')
-                target_port = port.get('TargetPort')
-                publish_mode = port.get('PublishMode', 'ingress')
+            # 如果 endpoint_ports 可用，则正常解析
+            if endpoint_ports:
+                for port in endpoint_ports:
+                    # 动态获取协议，不写死
+                    protocol = port.get('Protocol', 'tcp').lower()
+                    published_port = port.get('PublishedPort')
+                    target_port = port.get('TargetPort')
+                    publish_mode = port.get('PublishMode', 'ingress')
 
-                if published_port and target_port and publish_mode == 'ingress':
-                    ports.append({
-                        'protocol': protocol,  # 动态协议
-                        'published_port': published_port,
-                        'target_port': target_port,
-                        'publish_mode': publish_mode
-                    })
+                    if published_port and target_port and publish_mode == 'ingress':
+                        ports.append({
+                            'protocol': protocol,  # 动态协议
+                            'published_port': published_port,
+                            'target_port': target_port,
+                            'publish_mode': publish_mode
+                        })
+                return ports
+
+            # 回退：从本节点容器推导端口映射（不会包含集群 routing-mesh 的 published_port）
+            derived = self._derive_service_ports_from_containers(service_info.get('name'))
+            if derived:
+                self.logger.info(f"已从本节点容器推导出 Service {service_info.get('name')} 的端口映射（回退模式）: {derived}")
+                return derived
 
         except Exception as e:
             self.logger.error(f"提取Service端口配置失败: {e}")
 
         return ports
+
+    def _derive_service_ports_from_containers(self, service_name: str) -> List[Dict[str, Any]]:
+        """从本节点属于该 service 的容器推导出端口信息（回退方案）
+        逻辑：
+         - 针对每个容器，读取 HostConfig.PortBindings 与 NetworkSettings.Ports
+         - 若找到 HostPort (>0)，则把 published_port = HostPort, target_port = container_port
+         - 若找不到 HostPort，则把 published_port = container_port（意味着仅创建 FORWARD 规则，不做 DNAT）
+         - 合并去重后返回格式与 _extract_service_ports 保持一致
+        该方法不需要 manager 权限，只能反映当前节点可见的端口信息。
+        """
+        derived_ports = []
+        signatures = set()
+        try:
+            service_containers = self.client.containers.list(filters={'label': f'com.docker.swarm.service.name={service_name}'})
+            for container in service_containers:
+                info = self._get_container_info(container)
+                if not info:
+                    continue
+
+                host_config = info.get('host_config', {}) or {}
+                network_settings = info.get('network_settings', {}) or {}
+                port_bindings = host_config.get('PortBindings', {}) or {}
+                network_ports = network_settings.get('Ports', {}) or {}
+
+                # 首先处理 PortBindings（配置层）
+                if port_bindings:
+                    for port_spec, bindings in port_bindings.items():
+                        if '/' in port_spec:
+                            port_str, protocol = port_spec.split('/', 1)
+                        else:
+                            port_str, protocol = port_spec, 'tcp'
+                        try:
+                            target_port = int(port_str)
+                        except Exception:
+                            continue
+                        host_port = None
+                        host_ip = ''
+                        if bindings and isinstance(bindings, list) and bindings:
+                            try:
+                                host_port = int(bindings[0].get('HostPort', 0))
+                                host_ip = bindings[0].get('HostIp', '')
+                            except Exception:
+                                host_port = None
+
+                        published = host_port if host_port and host_port > 0 else target_port
+                        sig = f"{protocol}_{published}_{target_port}"
+                        if sig not in signatures:
+                            signatures.add(sig)
+                            derived_ports.append({
+                                'protocol': protocol,
+                                'published_port': published,
+                                'target_port': target_port,
+                                'publish_mode': 'derived'
+                            })
+
+                # 如果没有 PortBindings，再尝试 NetworkSettings.Ports（运行时）
+                elif network_ports:
+                    for port_spec, bindings in network_ports.items():
+                        if '/' in port_spec:
+                            port_str, protocol = port_spec.split('/', 1)
+                        else:
+                            port_str, protocol = port_spec, 'tcp'
+                        try:
+                            target_port = int(port_str)
+                        except Exception:
+                            continue
+
+                        host_port = None
+                        if bindings and isinstance(bindings, list):
+                            for b in bindings:
+                                try:
+                                    hp = int(b.get('HostPort', 0))
+                                    if hp > 0:
+                                        host_port = hp
+                                        break
+                                except Exception:
+                                    continue
+
+                        published = host_port if host_port and host_port > 0 else target_port
+                        sig = f"{protocol}_{published}_{target_port}"
+                        if sig not in signatures:
+                            signatures.add(sig)
+                            derived_ports.append({
+                                'protocol': protocol,
+                                'published_port': published,
+                                'target_port': target_port,
+                                'publish_mode': 'derived'
+                            })
+
+            return derived_ports
+        except Exception as e:
+            self.logger.error(f"从容器推导 service 端口失败: {e}")
+            return []
 
     def _get_service_containers(self, service_name: str) -> List[Dict[str, Any]]:
         """获取Service对应的本节点容器"""
